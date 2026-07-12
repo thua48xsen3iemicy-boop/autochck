@@ -23,6 +23,20 @@
   .notice.err { background: #fdeaea; border-color: #f0a9a9; color: #8a2020; }
   .empty { color: var(--muted); }
 
+  .cards { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 22px; }
+  .card {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    min-width: 92px; padding: 8px 12px; border-radius: 12px; cursor: pointer;
+    border: 1px solid transparent; color: #fff; font: inherit; text-align: left;
+    transition: transform .05s ease, box-shadow .1s ease;
+  }
+  .card:hover { transform: translateY(-1px); }
+  .card.done { background: var(--ok); }
+  .card.fail { background: var(--bad); }
+  .card-name { font-weight: 600; font-size: 15px; }
+  .card-grade { font-size: 12px; opacity: .9; }
+  .card.active { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--ink); }
+
   .lab { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px 18px 8px; margin-bottom: 18px; }
   .lab-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
   .lab-head h2 { font-size: 16px; margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); word-break: break-all; }
@@ -109,9 +123,22 @@
   <p class="empty">Пока нет ни одной проверки. Запустите проверку открытой лабораторной работы.</p>
   {% endif %}
 
+  {% if labs %}
+  <div class="cards">
+    {% for lab in labs %}
+    <button type="button" id="card-{{ loop.index0 }}"
+            class="card {{ 'done' if lab.latest.lab_done else 'fail' }}{{ ' active' if loop.index0 == sel_index else '' }}"
+            onclick="showLab({{ loop.index0 }})">
+      <span class="card-name">{{ lab.name }}</span>
+      <span class="card-grade">{{ lab.latest.grade if lab.latest.grade is not none else '—' }}</span>
+    </button>
+    {% endfor %}
+  </div>
+  {% endif %}
+
   {% for lab in labs %}
   {% set latest = lab.latest %}
-  <section class="lab">
+  <section class="lab" id="lab-{{ loop.index0 }}"{% if loop.index0 != sel_index %} style="display:none"{% endif %}>
     <div class="lab-head">
       <h2>{{ lab.lab_path }}</h2>
       <div class="badges">
@@ -144,5 +171,13 @@
   </section>
   {% endfor %}
 </div>
+<script>
+  function showLab(i) {
+    var labs = document.querySelectorAll('.lab');
+    for (var k = 0; k < labs.length; k++) { labs[k].style.display = (k === i) ? '' : 'none'; }
+    var cards = document.querySelectorAll('.card');
+    for (var k = 0; k < cards.length; k++) { cards[k].classList.toggle('active', k === i); }
+  }
+</script>
 </body>
 </html>

@@ -572,21 +572,49 @@ def start_bridge():
     dict_of_name_and_path = {}
     list_of_vmnames = []
 
-    for bridge in bridges:
-        for port in bridges[bridge]:
-            if port != 'eth0':
-                list_of_intname.append(port)
-                vmid = port.split('_')
-                list_of_vmid.append(vmid[0])
-                vmname, vmpath, *_ = (get_name_and_path_by_int_id(vmid[0]))
-                list_of_vmnames.append(vmname)
-                if vmname in dict_of_name_and_intname:
-                    dict_of_name_and_intname[vmname] = dict_of_name_and_intname[vmname] + ' ' + port
-                else:
-                    dict_of_name_and_intname[vmname] = port
+    orphan_ports = []
+    cleaned_bridges = {}
 
-                dict_of_name_and_path[vmname] = vmpath
-                
+    for bridge in bridges:
+        cleaned_ports = []
+        for port in bridges[bridge]:
+            # Физический аплинк (eth0 под pnet0) и прочие не-vunl порты оставляем как есть
+            if not port.startswith('vunl'):
+                cleaned_ports.append(port)
+                continue
+
+            vmid = port.split('_')
+            result = get_name_and_path_by_int_id(vmid[0])
+            # get_name_and_path_by_int_id возвращает кортеж (vmname, vmpath) при успехе
+            # и строку-ошибку, если живого qemu-процесса для этого tap нет.
+            if not isinstance(result, tuple):
+                # У tap-интерфейса нет процесса qemu — осиротевший мост чужой/остановленной лабы
+                orphan_ports.append(port)
+                continue
+
+            vmname, vmpath, *_ = result
+            cleaned_ports.append(port)
+            list_of_intname.append(port)
+            list_of_vmid.append(vmid[0])
+            list_of_vmnames.append(vmname)
+            if vmname in dict_of_name_and_intname:
+                dict_of_name_and_intname[vmname] = dict_of_name_and_intname[vmname] + ' ' + port
+            else:
+                dict_of_name_and_intname[vmname] = port
+
+            dict_of_name_and_path[vmname] = vmpath
+
+        # Мост оставляем, только если в нём остались валидные порты.
+        # pnet0 при этом сохраняется автоматически — у него легитимно только eth0.
+        if cleaned_ports:
+            cleaned_bridges[bridge] = cleaned_ports
+
+    removed_bridges = [b for b in bridges if b not in cleaned_bridges]
+    if orphan_ports:
+        log('orphan ports skipped (no qemu process)', orphan_ports)
+        log('orphan bridges removed', removed_bridges)
+        log_and_print(f'Пропущены осиротевшие интерфейсы без процесса qemu: {orphan_ports}, удалены мосты: {removed_bridges}')
+
     list_of_vmid = list(set(list_of_vmid))
     list_of_vmnames = list(set(list_of_vmnames))
 
@@ -599,7 +627,7 @@ def start_bridge():
     log('list_of_intname:', list_of_intname)
     log('dict_of_name_and_intname:', dict_of_name_and_intname)
    
-    return(dict_of_name_and_path, list_of_vmnames, list_of_intname, dict_of_name_and_intname, bridges)
+    return(dict_of_name_and_path, list_of_vmnames, list_of_intname, dict_of_name_and_intname, cleaned_bridges)
 
 
 def execute_command_sync(command, os_type, socket_path):

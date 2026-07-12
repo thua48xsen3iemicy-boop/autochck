@@ -52,14 +52,49 @@
   .errors ul { margin: 4px 0 0; padding-left: 18px; }
   .errors li { color: #7a2b2b; }
 
-  details.history { margin: 12px 0 10px; }
-  details.history summary { cursor: pointer; color: var(--accent); font-size: 14px; padding: 4px 0; }
-  .attempts th, .attempts td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 13px; }
-  .attempts th { color: var(--muted); font-weight: 500; }
-  .attempts td { font-variant-numeric: tabular-nums; }
+  details.history { margin: 12px 0 4px; }
+  details.history > summary { cursor: pointer; color: var(--accent); font-size: 14px; padding: 4px 0; }
+
+  details.attempt { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; background: #fbfcfd; }
+  details.attempt > summary { cursor: pointer; list-style: none; padding: 8px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  details.attempt > summary::-webkit-details-marker { display: none; }
+  details.attempt > summary::before { content: "▸"; color: var(--muted); font-size: 12px; }
+  details.attempt[open] > summary::before { content: "▾"; }
+  details.attempt[open] > summary { border-bottom: 1px solid var(--line); }
+  details.attempt > table, details.attempt > .errors { margin-left: 12px; margin-right: 12px; }
+  details.attempt > table.checks { width: calc(100% - 24px); }
+  .badge.muted { color: var(--muted); }
 </style>
 </head>
 <body>
+{# Детальная разбивка одной попытки: баллы по проверкам, штрафы, замечания #}
+{% macro detail(a) %}
+    <table class="checks">
+      <thead><tr><th>Проверка</th><th>Баллы</th></tr></thead>
+      <tbody>
+      {% for it in a['items'] %}
+        <tr class="{% if it.max == 0 %}row-zero{% elif it.score == it.max %}row-ok{% else %}row-bad{% endif %}">
+          <td>{{ it.name }}</td>
+          <td>{{ it.score }} / {{ it.max }}</td>
+        </tr>
+      {% endfor %}
+      {% for pname, p in a['penalties'].items() %}
+        <tr class="row-penalty">
+          <td>{{ pname }} (штраф)</td>
+          <td>−{{ p.points }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% if a['errors'] %}
+    <div class="errors">
+      <div class="errors-title">Замечания</div>
+      <ul>
+      {% for e in a['errors'] %}<li>{{ e }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+{% endmacro %}
 <div class="wrap">
   <header class="top">
     <h1>Результаты проверок</h1>
@@ -87,50 +122,23 @@
       </div>
     </div>
 
-    <table class="checks">
-      <thead><tr><th>Проверка</th><th>Баллы</th></tr></thead>
-      <tbody>
-      {% for it in latest['items'] %}
-        <tr class="{% if it.max == 0 %}row-zero{% elif it.score == it.max %}row-ok{% else %}row-bad{% endif %}">
-          <td>{{ it.name }}</td>
-          <td>{{ it.score }} / {{ it.max }}</td>
-        </tr>
-      {% endfor %}
-      {% for pname, p in latest['penalties'].items() %}
-        <tr class="row-penalty">
-          <td>{{ pname }} (штраф)</td>
-          <td>−{{ p.points }}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-
-    {% if latest['errors'] %}
-    <div class="errors">
-      <div class="errors-title">Замечания</div>
-      <ul>
-      {% for e in latest['errors'] %}<li>{{ e }}</li>{% endfor %}
-      </ul>
-    </div>
-    {% endif %}
+    {{ detail(latest) }}
 
     {% if lab.attempts|length > 1 %}
     <details class="history">
       <summary>История попыток — {{ lab.attempts|length }}</summary>
-      <table class="attempts">
-        <thead><tr><th>Время</th><th>Баллы</th><th>%</th><th>Оценка</th><th>Статус</th></tr></thead>
-        <tbody>
-        {% for a in lab.attempts %}
-          <tr>
-            <td>{{ a.ts }}</td>
-            <td>{{ a.score }} / {{ a.max_score }}</td>
-            <td>{{ a.percent }}</td>
-            <td>{{ a.grade if a.grade is not none else '—' }}</td>
-            <td>{% if a.lab_done %}Сдано{% else %}—{% endif %}</td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
+      {% for a in lab.attempts[1:] %}
+      <details class="attempt">
+        <summary>
+          <span class="ts">{{ a.ts }}</span>
+          <span class="badge score">{{ a.score }} / {{ a.max_score }}</span>
+          <span class="badge muted">{{ a.percent }}%</span>
+          {% if a.grade is not none %}<span class="badge grade grade-{{ a.grade }}">Оценка: {{ a.grade }}</span>{% endif %}
+          {% if a.lab_done %}<span class="badge done ok">Сдано</span>{% else %}<span class="badge done">Не сдано</span>{% endif %}
+        </summary>
+        {{ detail(a) }}
+      </details>
+      {% endfor %}
     </details>
     {% endif %}
   </section>

@@ -196,8 +196,12 @@ def load_dashboard(db_path=RESULT_DB_PATH):
             r['penalties'] = {}
         labs.setdefault(r['lab_path'], []).append(r)
 
-    result = [{'lab_path': lp, 'attempts': att, 'latest': att[0]}
-              for lp, att in labs.items()]
+    result = []
+    for lp, att in labs.items():
+        # Короткое имя лабы из пути: //GROUPS/OA-2501/KS24.unl -> KS24
+        base = lp.rsplit('/', 1)[-1]
+        name = base.rsplit('.', 1)[0] if '.' in base else base
+        result.append({'lab_path': lp, 'name': name, 'attempts': att, 'latest': att[0]})
     # Лабы с самой свежей попыткой — вверх
     result.sort(key=lambda l: l['latest']['id'], reverse=True)
     return result
@@ -1320,13 +1324,24 @@ async def openlab():
     else:
         return None
 
-async def render_dashboard(request: Request, notice=None, status=None):
-    """Общий рендер дашборда результатов из SQLite."""
+async def render_dashboard(request: Request, notice=None, status=None, current_lab=None):
+    """Общий рендер дашборда результатов из SQLite.
+
+    current_lab — путь лабы, чью детальную выдачу открыть по умолчанию (например,
+    только что проверенная). Если не задан/не найден — открывается самая свежая.
+    """
     loop = asyncio.get_event_loop()
     labs = await loop.run_in_executor(None, load_dashboard)
+    sel_index = 0
+    if current_lab:
+        for i, lab in enumerate(labs):
+            if lab['lab_path'] == current_lab:
+                sel_index = i
+                break
     return templates.TemplateResponse("results.html", {
         "request": request,
         "labs": labs,
+        "sel_index": sel_index,
         "username": username,
         "clientip": str(clientip),
         "notice": notice,
@@ -2593,7 +2608,8 @@ async def ping(request: Request, fmt: str = Query('auto')):
         notice = None
         if answer['status'] != '200':
             notice = answer.get('errorinfo') or forweb.get('lab_path')
-        return await render_dashboard(request, notice=notice, status=answer['status'])
+        return await render_dashboard(request, notice=notice, status=answer['status'],
+                                      current_lab=answer.get('lab_path'))
 
 
     except Exception:

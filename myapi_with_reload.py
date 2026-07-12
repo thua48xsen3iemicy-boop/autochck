@@ -13,6 +13,7 @@ from collections import defaultdict
 from collections import deque
 import socket
 import json
+import sqlite3
 import time
 import telnetlib
 import argparse
@@ -59,6 +60,82 @@ with open(usrfile_path) as f:
 with open(admfile_path) as file:
     admin_list = [line.rstrip() for line in file]
     print('admins', admin_list)
+
+# ------------------------------------------------------------------ Результаты (SQLite)
+# По одной БД на студента, в его личном mount-point (cephfs), по аналогии с result.json.
+RESULT_DB_PATH = '/data/result.db'
+
+def init_db(db_path=RESULT_DB_PATH):
+    """Создаёт схему БД результатов (идемпотентно). Вызывается на старте."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                username TEXT,
+                clientip TEXT,
+                lab_path TEXT,
+                status TEXT,
+                score INTEGER,
+                max_score INTEGER,
+                percent REAL,
+                grade INTEGER,
+                lab_done INTEGER,
+                errors_json TEXT,
+                errorinfo TEXT,
+                debug_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS check_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id),
+                name TEXT,
+                score INTEGER,
+                max INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_runs_lab_ts ON runs(lab_path, ts);
+            CREATE INDEX IF NOT EXISTS idx_items_run ON check_items(run_id);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+def grade_from_percent(percent):
+    """Процент выполнения -> оценка 2..5."""
+    if percent >= 86:
+        return 5
+    elif percent >= 71:
+        return 4
+    elif percent >= 51:
+        return 3
+    return 2
+
+def save_run(run, checks, db_path=RESULT_DB_PATH):
+    """Сохраняет один прогон (runs) и разбивку по проверкам (check_items). Возвращает run_id.
+
+    Блокирующая функция — в async-хендлере вызывать через run_in_executor.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO runs
+               (ts, username, clientip, lab_path, status, score, max_score,
+                percent, grade, lab_done, errors_json, errorinfo, debug_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (run['ts'], run['username'], run['clientip'], run['lab_path'],
+             run['status'], run['score'], run['max_score'], run['percent'],
+             run['grade'], run['lab_done'], run['errors_json'],
+             run.get('errorinfo'), run.get('debug_json')))
+        run_id = cur.lastrowid
+        cur.executemany(
+            "INSERT INTO check_items (run_id, name, score, max) VALUES (?,?,?,?)",
+            [(run_id, name, c['score'], c['max']) for name, c in checks.items()])
+        conn.commit()
+        return run_id
+    finally:
+        conn.close()
 
 def cidr_to_network_mask(cidr: str) -> str:
     """
@@ -346,6 +423,10 @@ def prestart():
         'database': 'pnetlab_db'
     }
     log_and_print('Prestart func')
+    try:
+        init_db()
+    except Exception as e:
+        log('init_db err', e)
     was_run = os.path.isfile('/tmp/prestart_run')
 
     if not was_run or force:
@@ -1240,6 +1321,19 @@ async def ping():
         answer = {}
         errors = {}
         forweb = {}
+
+        # Единый аккумулятор оценок по проверкам: {name: {"score", "max"}}.
+        # Перезапись по имени повторяет прежнее поведение forweb (последний выигрывает,
+        # напр. в цикле SNAT). Score клампится в [0..max], чтобы тяжёлые штрафы
+        # одной проверки не уводили общий счёт в минус. forweb пишем параллельно
+        # для обратной совместимости (JSON-возврат админу, /report по result.json).
+        checks = {}
+        def add_check(name, score, maxv):
+            maxv = int(maxv)
+            s = max(0, min(int(score), maxv))
+            checks[name] = {"score": s, "max": maxv}
+            forweb[name] = f'{s} / {maxv}'
+
         #errors['time'] = formatted_time
         answer['time'] = formatted_time
         #forweb['time'] = formatted_time
@@ -1754,7 +1848,7 @@ async def ping():
                             err_list.append(vmname)
                             err_count = err_count + 10
                 good_count = chk_count - err_count
-                forweb['Hostnames'] = f'{good_count} / {chk_count}'
+                add_check('Hostnames', good_count, chk_count)
                 if err_count != 0:
                     errors['errors_noty'].append(f'Похоже имеются проблемы с именами на узлах: {err_list}')
 
@@ -1786,7 +1880,7 @@ async def ping():
                 if tmp_err_autoconf:
                     errors['errors_noty'].append(f'Похоже dhcp клиент не получил ответа и назначил адреса из сети 169.254.0.0/16: {tmp_err_autoconf}')
                 good_count = chk_count - err_count
-                forweb['Ip Addresses'] = f'{good_count} / {chk_count}'
+                add_check('Ip Addresses', good_count, chk_count)
 
                 #### networks
                 chk_count = len(bridges) - 1
@@ -1819,7 +1913,7 @@ async def ping():
                         else:
                             errors["crit"] = "err"
                 good_count = chk_count - err_count - crit_err
-                forweb['Networks'] = f'{good_count} / {chk_count}'
+                add_check('Networks', good_count, chk_count)
 
                 #### Duplicate IP
                 chk_count = 1
@@ -1834,7 +1928,7 @@ async def ping():
                     errors['errors_noty'].append(f'Имеются повторяющиеся адреса: {dup_vmnames}')
                     #return 'Имеются повторяющиеся адреса', dup_vmnames
                 good_count = chk_count - err_count
-                forweb['nodup_ipaddr'] = f'{good_count} / {chk_count}'
+                add_check('nodup_ipaddr', good_count, chk_count)
 
                 #### IP is private
                 chk_count = 1
@@ -1849,7 +1943,7 @@ async def ping():
                     # else:
                     #     err_count = err_count + 1
                 good_count = chk_count - err_count
-                forweb['IP is private'] = f'{good_count} / {chk_count}'
+                add_check('IP is private', good_count, chk_count)
 
                 #### Def gw is present
                 chk_count = len(list_of_vmnames)
@@ -1865,11 +1959,11 @@ async def ping():
                     if tmplist:
                         errors['Нет шлюза по умолчанию'] = tmplist
                     good_count = chk_count - err_count
-                    forweb['Default gw present'] = f'{good_count} / {chk_count}'
+                    add_check('Default gw present', good_count, chk_count)
                     if err_count != 0:
                         errors['errors_noty'].append(f'Нет default gateway: {err_list}')
                 else:
-                    forweb['Default gw present'] = f'0 / 0'
+                    add_check('Default gw present', 0, 0)
                 #### Def gw is good
                 print('start def gw is good')
                 chk_count = len(list_of_vmnames)
@@ -1895,9 +1989,9 @@ async def ping():
                     good_count = chk_count - err_count
                     if err_count != 0:
                         errors['errors_noty'].append(f'Есть проблемы с default gateway: {err_list}')
-                    forweb['Default gw good'] = f'{good_count} / {chk_count}'
+                    add_check('Default gw good', good_count, chk_count)
                 else:
-                    forweb['Default gw good'] = f'0 / 0'
+                    add_check('Default gw good', 0, 0)
 
                 #### Networ overlaps
                 network_list = []
@@ -1923,7 +2017,7 @@ async def ping():
                                 err_count = err_count + 30
 
                 good_count = chk_count - err_count
-                forweb['Forwarding_enable'] = f'{good_count} / {chk_count}'
+                add_check('Forwarding_enable', good_count, chk_count)
 
                 #### IP forwardin is disaabled on linux clients
                 chk_count = 0
@@ -1940,7 +2034,7 @@ async def ping():
                                 chk_count = chk_count + 1
 
                 good_count = chk_count - err_count
-                forweb['Forwarding_disable'] = f'{good_count} / {chk_count}'
+                add_check('Forwarding_disable', good_count, chk_count)
 
                 #### DNS servers
                 print('start def DNS')
@@ -1955,7 +2049,7 @@ async def ping():
                     errors['Не указан dns сервер'] = tmplist
                     errors['errors_noty'].append(f'Не указан dns сервер: {tmplist}')
                 good_count = chk_count - err_count
-                forweb['dnsclient_ip_addr'] = f'{good_count} / {chk_count}'
+                add_check('dnsclient_ip_addr', good_count, chk_count)
 
                 #### SNAT ######
                 chk_count = len(list_of_routers) + 1 * len(list_of_routers)
@@ -1993,7 +2087,7 @@ async def ping():
                             err_count = err_count + 10
                             errors['errors_noty'].append(f'Не настроен маскарад: {router}')
                         good_count = chk_count - err_count
-                        forweb['snat_nftables'] = f'{good_count} / {chk_count}'
+                        add_check('snat_nftables', good_count, chk_count)
                         if errors['SNAT']:
                             errors['errors_noty'].append(f'Не настроен маскарад: {errors["SNAT"]}')
                         if errors['nftables']:
@@ -2057,7 +2151,7 @@ async def ping():
                             errors['errors_noty'].append(f'Котроллер домена не развернут: {name}')
                             answer['WinDomain'] = 'NODOMAINWINSRVHOST'
                     answer['dict_of_name_winservers_script'] = dict_of_name_winservers_script
-                    forweb['Win Domain'] = f'{good_count} / {chk_count}'
+                    add_check('Win Domain', good_count, chk_count)
                     
 
                 ######### DOMAIN CLIENTS CHECK
@@ -2080,7 +2174,7 @@ async def ping():
                 if join_domain_err:
                     errors['errors_noty'].append(f'Есть не введенные в домен узлы: {join_domain_err}')
                 good_count = chk_count - err_count
-                forweb['joined_to_domain'] = f'{good_count} / {chk_count}'
+                add_check('joined_to_domain', good_count, chk_count)
                 answer['dict_of_vmnames_hostname'] = dict_of_vmnames_hostname
                 
                 ########## MULTI ROUTES
@@ -2123,9 +2217,9 @@ async def ping():
                                     errors['errors_noty'].append(f'Что-то не так с роутом до сети {network}')
                                     err_count = err_count + 10
                     good_count = chk_count - err_count
-                    forweb['multiroutes'] = f'{good_count} / {chk_count}'
+                    add_check('multiroutes', good_count, chk_count)
                 else:
-                    forweb['multiroutes'] = f'0 / 0'
+                    add_check('multiroutes', 0, 0)
 
 
 
@@ -2221,7 +2315,7 @@ async def ping():
                         
 
                     good_count = chk_count - err_count
-                    forweb['special'] = f'{good_count} / {chk_count}'
+                    add_check('special', good_count, chk_count)
 
 
 
@@ -2336,25 +2430,21 @@ async def ping():
         tmpdict['clientip'] = str(clientip)
         if answer['status'] != 'warn':
             answer['status'] = '200'
+
+        # Единый подсчёт итога из structured checks (без парсинга строк " / ").
+        score = sum(c['score'] for c in checks.values())
+        max_score = sum(c['max'] for c in checks.values())
+        percent = (score / max_score * 100) if max_score else 0
+        grade = grade_from_percent(percent)
+        lab_done_flag = 1 if (max_score and score == max_score and not errors['errors_noty']) else 0
+        forweb['lab_done'] = 'yes' if lab_done_flag else 'no'
+
         forwebresult.update(tmpdict)
         forwebresult.update(answer)
         forwebresult.update(errors)
         forwebresult.update(forweb)
         forFileResult.update(forwebresult)
         os.remove('/tmp/chk.lock')
-        lab_done = {}
-        lab_done['lab_done'] = 'no'
-        score = 0
-        maxscore = 0
-        for dict_element in forwebresult.values():
-            if ' / ' in dict_element:
-                dict_element = dict_element.replace(' ', '')
-                sample = dict_element.split('/')
-                score = score + int(sample[0])
-                maxscore = maxscore + int(sample[1])
-                if score == maxscore and len(errors['errors_noty']) == 0:
-                    lab_done['lab_done'] = 'yes'
-        forwebresult.update(lab_done)
 
 
         forFileResult.pop('dict_of_name_fullcmd', None)
@@ -2389,29 +2479,33 @@ async def ping():
         selected_students = {name: forFileResult[name] 
                             for name in forFileResult 
                             if name in selected_names}        
-        # return forwebresult
-        score = 0
-        maxscore = 0
-        for line in forFileResult.values():
-            if ' / ' in line:
-                line = line.replace(' ', '')
-                sample = line.split('/')
-                score = score + int(sample[0])
-                maxscore = maxscore + int(sample[1])
-        
-        if maxscore != 0:
-            percent = score / maxscore * 100
-            ocenka = 2
-            if percent >= 86:
-                ocenka = 5
-            elif percent >= 71:
-                ocenka = 4
-            elif percent >= 51:
-                ocenka = 3
-            elif percent >= 0:
-                ocenka = 2
-            selected_students['score'] = f"{score} / {maxscore}"
-            selected_students['Оценка'] = ocenka
+        if max_score != 0:
+            selected_students['score'] = f"{score} / {max_score}"
+            selected_students['Оценка'] = grade
+
+        # Сохраняем прогон в SQLite (только реально проверенные лабы, status 200)
+        if answer['status'] == '200':
+            run = {
+                'ts': formatted_time,
+                'username': username,
+                'clientip': str(clientip),
+                'lab_path': answer.get('lab_path', forweb.get('lab_path', '')),
+                'status': answer['status'],
+                'score': score,
+                'max_score': max_score,
+                'percent': round(percent, 2),
+                'grade': grade if max_score else None,
+                'lab_done': lab_done_flag,
+                'errors_json': json.dumps(errors['errors_noty'], ensure_ascii=False),
+                'errorinfo': answer.get('errorinfo'),
+                'debug_json': json.dumps(forFileResult, ensure_ascii=False),
+            }
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, save_run, run, checks)
+            except Exception as e:
+                log('save_run err', e)
+
         if username != "i.kushch":
             return selected_students
         else:

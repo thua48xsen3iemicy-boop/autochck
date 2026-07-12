@@ -45,6 +45,7 @@
   .row-ok td:last-child { color: var(--ok); }
   .row-bad td:last-child { color: var(--bad); font-weight: 600; }
   .row-zero td { color: var(--muted); }
+  .row-penalty td { color: var(--bad); font-weight: 600; background: #fdf3f3; }
 
   .errors { margin: 14px 0 6px; background: #fdf3f3; border: 1px solid #f2cccc; border-radius: 10px; padding: 10px 14px; }
   .errors-title { font-weight: 600; color: #8a2020; margin-bottom: 4px; }
@@ -93,6 +94,12 @@
         <tr class="{% if it.max == 0 %}row-zero{% elif it.score == it.max %}row-ok{% else %}row-bad{% endif %}">
           <td>{{ it.name }}</td>
           <td>{{ it.score }} / {{ it.max }}</td>
+        </tr>
+      {% endfor %}
+      {% for pname, p in latest['penalties'].items() %}
+        <tr class="row-penalty">
+          <td>{{ pname }} (штраф)</td>
+          <td>−{{ p.points }}</td>
         </tr>
       {% endfor %}
       </tbody>

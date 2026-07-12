@@ -87,7 +87,8 @@ def init_db(db_path=RESULT_DB_PATH):
                 lab_done INTEGER,
                 errors_json TEXT,
                 errorinfo TEXT,
-                debug_json TEXT
+                debug_json TEXT,
+                penalties_json TEXT
             );
             CREATE TABLE IF NOT EXISTS check_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,6 +100,10 @@ def init_db(db_path=RESULT_DB_PATH):
             CREATE INDEX IF NOT EXISTS idx_runs_lab_ts ON runs(lab_path, ts);
             CREATE INDEX IF NOT EXISTS idx_items_run ON check_items(run_id);
         """)
+        # Миграция для БД, созданных до появления penalties_json
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)")]
+        if 'penalties_json' not in cols:
+            conn.execute("ALTER TABLE runs ADD COLUMN penalties_json TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -118,11 +123,17 @@ def grade_from_percent(percent):
 # Модель подсчёта: каждая проверка = набор элементов, max = число элементов,
 # score = max - число ошибок (одна ошибка = -1 элемент), затем score/max умножаются на вес.
 CHECK_WEIGHTS = {
-    'Forwarding_disable': 3,
     'IP is private': 3,
     'nodup_ipaddr': 3,
     'snat_nftables': 3,
     'Default gw good': 3,
+}
+
+# Штрафные проверки: то, чего быть НЕ должно (по умолчанию отсутствует), поэтому
+# правильное состояние не даёт баллов (не входит в max), а нарушение вычитает
+# указанное число баллов из итогового счёта. Значение — штраф за каждый узел-нарушитель.
+PENALTIES = {
+    'Forwarding_disable': 10,
 }
 
 def save_run(run, checks, db_path=RESULT_DB_PATH):
@@ -136,12 +147,12 @@ def save_run(run, checks, db_path=RESULT_DB_PATH):
         cur.execute(
             """INSERT INTO runs
                (ts, username, clientip, lab_path, status, score, max_score,
-                percent, grade, lab_done, errors_json, errorinfo, debug_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                percent, grade, lab_done, errors_json, errorinfo, debug_json, penalties_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (run['ts'], run['username'], run['clientip'], run['lab_path'],
              run['status'], run['score'], run['max_score'], run['percent'],
              run['grade'], run['lab_done'], run['errors_json'],
-             run.get('errorinfo'), run.get('debug_json')))
+             run.get('errorinfo'), run.get('debug_json'), run.get('penalties_json')))
         run_id = cur.lastrowid
         cur.executemany(
             "INSERT INTO check_items (run_id, name, score, max) VALUES (?,?,?,?)",
@@ -179,6 +190,10 @@ def load_dashboard(db_path=RESULT_DB_PATH):
             r['errors'] = json.loads(r['errors_json']) if r['errors_json'] else []
         except (ValueError, TypeError):
             r['errors'] = []
+        try:
+            r['penalties'] = json.loads(r.get('penalties_json')) if r.get('penalties_json') else {}
+        except (ValueError, TypeError):
+            r['penalties'] = {}
         labs.setdefault(r['lab_path'], []).append(r)
 
     result = [{'lab_path': lp, 'attempts': att, 'latest': att[0]}
@@ -1369,6 +1384,15 @@ async def ping(request: Request, fmt: str = Query('auto')):
             checks[name] = {"score": s * w, "max": maxv * w}
             forweb[name] = f'{s * w} / {maxv * w}'
 
+        # Штрафы: не входят в max, а вычитаются из итога. {name: {"count", "points"}}
+        penalties = {}
+        def add_penalty(name, count):
+            count = int(count)
+            if count > 0:
+                points = count * PENALTIES.get(name, 0)
+                penalties[name] = {"count": count, "points": points}
+                forweb[name] = f'штраф -{points}'
+
         #errors['time'] = formatted_time
         answer['time'] = formatted_time
         #forweb['time'] = formatted_time
@@ -2073,20 +2097,19 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 add_check('Forwarding_enable', good_count, chk_count)
 
                 #### IP forwardin is disaabled on linux clients
-                chk_count = 0
-                err_count = 0
+                # Штрафная проверка: forwarding на клиенте по умолчанию выключен,
+                # поэтому корректное состояние баллов не даёт, а включённый — штрафуется.
+                bad_fwd = 0
                 tasks = []
                 for name in list_of_vmnames:
                     if dict_of_name_and_ostype[name] == 'linux' and name not in list_of_routers:
-                        chk_count = chk_count + 1
                         for forwarding in dict_of_name_fullcmd[name]['FORWARDING']:
                             if 'net.ipv4.ip_forward' in forwarding and forwarding.split()[2] != '0':
-                                err_count = err_count + 1
+                                bad_fwd = bad_fwd + 1
                                 errors['errors_noty'].append(f'Форвардинг пакетов включен на каком-то из клиентов')
                                 errors['Форвардинг пакетов включен на каком-то из клиентов'] = 'err'
 
-                good_count = chk_count - err_count
-                add_check('Forwarding_disable', good_count, chk_count)
+                add_penalty('Forwarding_disable', bad_fwd)
 
                 #### DNS servers
                 print('start def DNS')
@@ -2484,12 +2507,15 @@ async def ping(request: Request, fmt: str = Query('auto')):
         if answer['status'] != 'warn':
             answer['status'] = '200'
 
-        # Единый подсчёт итога из structured checks (без парсинга строк " / ").
-        score = sum(c['score'] for c in checks.values())
+        # Единый подсчёт итога: сумма баллов проверок минус штрафы (штрафы в max не входят).
+        checks_score = sum(c['score'] for c in checks.values())
         max_score = sum(c['max'] for c in checks.values())
+        penalties_total = sum(p['points'] for p in penalties.values())
+        score = max(0, checks_score - penalties_total)
         percent = (score / max_score * 100) if max_score else 0
         grade = grade_from_percent(percent)
-        lab_done_flag = 1 if (max_score and score == max_score and not errors['errors_noty']) else 0
+        # Сдано начиная с оценки 3
+        lab_done_flag = 1 if (max_score and grade >= 3) else 0
         forweb['lab_done'] = 'yes' if lab_done_flag else 'no'
 
         forwebresult.update(tmpdict)
@@ -2550,6 +2576,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 'errors_json': json.dumps(errors['errors_noty'], ensure_ascii=False),
                 'errorinfo': answer.get('errorinfo'),
                 'debug_json': json.dumps(forFileResult, ensure_ascii=False),
+                'penalties_json': json.dumps(penalties, ensure_ascii=False),
             }
             try:
                 loop = asyncio.get_event_loop()

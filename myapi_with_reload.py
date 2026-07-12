@@ -113,6 +113,18 @@ def grade_from_percent(percent):
         return 3
     return 2
 
+# Множитель веса для критичных проверок (грубые ошибки сетевого администратора
+# стоят дороже, но раздел всё равно не обнуляется от одной ошибки). Остальные — вес 1.
+# Модель подсчёта: каждая проверка = набор элементов, max = число элементов,
+# score = max - число ошибок (одна ошибка = -1 элемент), затем score/max умножаются на вес.
+CHECK_WEIGHTS = {
+    'Forwarding_disable': 3,
+    'IP is private': 3,
+    'nodup_ipaddr': 3,
+    'snat_nftables': 3,
+    'Default gw good': 3,
+}
+
 def save_run(run, checks, db_path=RESULT_DB_PATH):
     """Сохраняет один прогон (runs) и разбивку по проверкам (check_items). Возвращает run_id.
 
@@ -1353,8 +1365,9 @@ async def ping(request: Request, fmt: str = Query('auto')):
         def add_check(name, score, maxv):
             maxv = int(maxv)
             s = max(0, min(int(score), maxv))
-            checks[name] = {"score": s, "max": maxv}
-            forweb[name] = f'{s} / {maxv}'
+            w = CHECK_WEIGHTS.get(name, 1)
+            checks[name] = {"score": s * w, "max": maxv * w}
+            forweb[name] = f'{s * w} / {maxv * w}'
 
         #errors['time'] = formatted_time
         answer['time'] = formatted_time
@@ -1380,6 +1393,9 @@ async def ping(request: Request, fmt: str = Query('auto')):
         dict_of_name_cisco_script = {}
         dict_of_name_winservers_script = {}
         dict_of_intnames_ipaddr = {}
+        # Реальный адрес интерфейса, сохраняется даже когда статус схлопнут в MULTI,
+        # чтобы проверка шлюза не «протекала» из-за токенов NONE/MULTI/DOWN.
+        dict_of_intnames_realaddr = {}
         dict_of_vmnames_hostname = {}
         dict_of_vmnames_defgw = {}
         dict_of_intnames_network = {}
@@ -1600,6 +1616,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                                 dict_of_intnames_ipaddr[int_name_router] = addr_line.split()[2]
                                             else:
                                                 dict_of_intnames_ipaddr[int_name_router] = addr_line.split()[1]
+                                            dict_of_intnames_realaddr[int_name_router] = dict_of_intnames_ipaddr[int_name_router]
                                 elif count == 0:
                                     dict_of_intnames_ipaddr[int_name_router] = "NONE"
                                 elif count > 1:
@@ -1676,14 +1693,18 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                 dict_of_intnames_ipaddr[intname] = "NONE"
                                 continue
 
+                            ips = linux_ints[guest_if]['ipv4']
+                            if ips:
+                                # Реальный адрес сохраняем всегда, даже при MULTI
+                                dict_of_intnames_realaddr[intname] = ips[0]
                             if linux_ints[guest_if]['state'] == 'DOWN':
                                 dict_of_intnames_ipaddr[intname] = "DOWN"
-                            elif len(linux_ints[guest_if]['ipv4']) == 0:
+                            elif len(ips) == 0:
                                 dict_of_intnames_ipaddr[intname] = "NONE"
-                            elif len(linux_ints[guest_if]['ipv4']) > 1 and not gre_present:
+                            elif len(ips) > 1 and not gre_present:
                                 dict_of_intnames_ipaddr[intname] = "MULTI"
                             else:
-                                dict_of_intnames_ipaddr[intname] = linux_ints[guest_if]['ipv4'][0]
+                                dict_of_intnames_ipaddr[intname] = ips[0]
 
 
 
@@ -1705,6 +1726,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                 winmasks = re.findall(pattern, line)
                                 for winmask in winmasks:
                                     dict_of_intnames_ipaddr[dict_of_name_and_intname[name][0]] = winip + '/' + str(mask_to_prefix(winmask))
+                                    dict_of_intnames_realaddr[dict_of_name_and_intname[name][0]] = winip + '/' + str(mask_to_prefix(winmask))
 
                             elif 'Default' in line:
                                 pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
@@ -1863,12 +1885,12 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         if vmname.upper() not in dict_of_vmnames_hostname[vmname].upper():
                             errors["hostnames"] = vmname
                             err_list.append(vmname)
-                            err_count = err_count + 10
+                            err_count = err_count + 1
                     else:
                         if vmname.upper() != dict_of_vmnames_hostname[vmname].upper():
                             errors["hostnames"] = vmname
                             err_list.append(vmname)
-                            err_count = err_count + 10
+                            err_count = err_count + 1
                 good_count = chk_count - err_count
                 add_check('Hostnames', good_count, chk_count)
                 if err_count != 0:
@@ -1885,16 +1907,21 @@ async def ping(request: Request, fmt: str = Query('auto')):
                     if 'gre0' in intname or 'gretap' in intname or 'erspan' in intname:
                         continue
                     vmname = get_vmname_by_intname(intname, dict_of_name_and_intname)
-                    if dict_of_intnames_ipaddr[intname] == 'NONE' or dict_of_intnames_ipaddr[intname] == 'MULTI' or dict_of_intnames_ipaddr[intname] == 'DOWN':
+                    v = dict_of_intnames_ipaddr[intname]
+                    bad = False
+                    if v == 'NONE' or v == 'MULTI' or v == 'DOWN':
                         errors["ipaddrs"] = vmname
                         tmp_err_ip.append(vmname)
-                        err_count = err_count + 30                        
-                    if '/0' in dict_of_intnames_ipaddr[intname] or '/32' in dict_of_intnames_ipaddr[intname] or '/8' in dict_of_intnames_ipaddr[intname]:
-                        err_count = err_count + 30
+                        bad = True
+                    if '/0' in v or '/32' in v or '/8' in v:
                         tmp_err_mask.append(vmname)
-                    if re.match(ip_autoconf_pattern, dict_of_intnames_ipaddr[intname]):
-                        err_count = err_count + 30
+                        bad = True
+                    if re.match(ip_autoconf_pattern, v):
                         tmp_err_autoconf.append(vmname)
+                        bad = True
+                    # Один проблемный интерфейс = -1 элемент (не суммируем 30 за каждый признак)
+                    if bad:
+                        err_count = err_count + 1
                 if tmp_err_ip:
                     errors['errors_noty'].append(f'Имеются проблемы с адресами на узлах: {tmp_err_ip}')
                 if tmp_err_mask:
@@ -1907,7 +1934,6 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 #### networks
                 chk_count = len(bridges) - 1
                 err_count = 0
-                crit_err = 0
 
                 for bridge in bridges:
                     if bridge != 'pnet0':
@@ -1927,14 +1953,14 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                         for intname2 in dict_of_name_and_intname[vmname]:
                                             if intname == intname2:
                                                 bad_nets.append(vmname)
-                                err_count = len(bad_nets) + 30
+                                # Мост с разными сетями = -1 элемент
+                                err_count = err_count + 1
                                 errors["multinet_in_l2domain"] = bad_nets
-                                crit_err = len(bad_nets)
                                 errors['errors_noty'].append(f'Разные сети в одном широковещательном домене: {bad_nets}')
-                        
+
                         else:
                             errors["crit"] = "err"
-                good_count = chk_count - err_count - crit_err
+                good_count = chk_count - err_count
                 add_check('Networks', good_count, chk_count)
 
                 #### Duplicate IP
@@ -1945,7 +1971,8 @@ async def ping(request: Request, fmt: str = Query('auto')):
                     dup_vmnames = []
                     for intname in dup_ips_intnames:
                         dup_vmnames.append(get_vmname_by_intname(intname, dict_of_name_and_intname))
-                        err_count = err_count + 30
+                    # Бинарная проверка: есть дубликаты или нет
+                    err_count = 1
                     errors["Имеются повторяющиеся адреса"] = dup_vmnames
                     errors['errors_noty'].append(f'Имеются повторяющиеся адреса: {dup_vmnames}')
                     #return 'Имеются повторяющиеся адреса', dup_vmnames
@@ -1960,7 +1987,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         if not is_private_network(dict_of_intnames_ipaddr[intname]):
                             #return 'Используются не приватные сети', get_vmname_by_intname(intname, dict_of_name_and_intname)
                             errors["Используются не приватные сети" + get_vmname_by_intname(intname, dict_of_name_and_intname)] = 'err'
-                            err_count = err_count + 30
+                            err_count = 1
                     
                     # else:
                     #     err_count = err_count + 1
@@ -1976,7 +2003,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                     for vmname in dict_of_vmnames_defgw:
                         if dict_of_vmnames_defgw[vmname] == 'NONE':
                             tmplist.append(vmname)
-                            err_count = err_count + 30
+                            err_count = err_count + 1
                             err_list.append(vmname)
                     if tmplist:
                         errors['Нет шлюза по умолчанию'] = tmplist
@@ -1993,21 +2020,25 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 err_list = []
                 if len(bridges['pnet0']) != 1:
                 #if "pnet0" in bridges:
-                    
+                    # Множество реальных адресов интерфейсов (по хост-части, без префикса).
+                    # Берём и из dict_of_intnames_ipaddr, и из realaddr — так шлюз находится,
+                    # даже если интерфейс схлопнут в MULTI (иначе раздел «протекал» бы в ноль).
+                    valid_gw_addrs = set()
+                    for a in list(dict_of_intnames_ipaddr.values()) + list(dict_of_intnames_realaddr.values()):
+                        if a and a not in ('NONE', 'MULTI', 'DOWN'):
+                            valid_gw_addrs.add(a.split('/')[0])
                     for vmname in dict_of_vmnames_defgw:
-                        trigger = 0
-                        for ipaddr in dict_of_intnames_ipaddr.values():
-                            if '10.254.' not in dict_of_vmnames_defgw[vmname]:
-                                if dict_of_vmnames_defgw[vmname] in ipaddr and dict_of_vmnames_defgw[vmname] != 'NONE':
-                                    trigger = 1
-                            else:
-                                trigger = 1
+                        gw = dict_of_vmnames_defgw[vmname]
+                        if gw.startswith('10.254.') or (gw != 'NONE' and gw.split('/')[0] in valid_gw_addrs):
+                            trigger = 1
+                        else:
+                            trigger = 0
                         if trigger == 0:
                             # return 'Не верный шлюз по умолчанию', vmname
                             errors['Не верный шлюз по умолчанию ' + vmname] = 'err'
                             errors['errors_noty'].append(f'Не верный шлюз по умолчанию: {vmname}')
                             err_list.append(vmname)
-                            err_count = err_count + 30
+                            err_count = err_count + 1
                     good_count = chk_count - err_count
                     if err_count != 0:
                         errors['errors_noty'].append(f'Есть проблемы с default gateway: {err_list}')
@@ -2036,7 +2067,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                             if 'net.ipv4.ip_forward' in forwarding and forwarding.split()[2] == '0':
                                 errors['errors_noty'].append(f'Форвардинг пакетов не включен на каком-то из маршрутизаторов')
                                 errors['Форвардинг пакетов не включен на каком-то из маршрутизаторов'] = 'err'
-                                err_count = err_count + 30
+                                err_count = err_count + 1
 
                 good_count = chk_count - err_count
                 add_check('Forwarding_enable', good_count, chk_count)
@@ -2047,20 +2078,19 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 tasks = []
                 for name in list_of_vmnames:
                     if dict_of_name_and_ostype[name] == 'linux' and name not in list_of_routers:
+                        chk_count = chk_count + 1
                         for forwarding in dict_of_name_fullcmd[name]['FORWARDING']:
                             if 'net.ipv4.ip_forward' in forwarding and forwarding.split()[2] != '0':
-                                err_count = err_count + 150
+                                err_count = err_count + 1
                                 errors['errors_noty'].append(f'Форвардинг пакетов включен на каком-то из клиентов')
                                 errors['Форвардинг пакетов включен на каком-то из клиентов'] = 'err'
-                            else:
-                                chk_count = chk_count + 1
 
                 good_count = chk_count - err_count
                 add_check('Forwarding_disable', good_count, chk_count)
 
                 #### DNS servers
                 print('start def DNS')
-                chk_count = 1
+                chk_count = len(dict_of_vmnames_dnssrv)
                 err_count = 0
                 tmplist = []
                 for vmname in dict_of_vmnames_dnssrv:
@@ -2106,7 +2136,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                             if 'masquerade' in nftrules:
                                 tmp = 1
                         if tmp == 0:
-                            err_count = err_count + 10
+                            err_count = err_count + 1
                             errors['errors_noty'].append(f'Не настроен маскарад: {router}')
                         good_count = chk_count - err_count
                         add_check('snat_nftables', good_count, chk_count)
@@ -2202,7 +2232,8 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 ########## MULTI ROUTES
                 
                 if len(list_of_routers) > 1 and len(bridges['pnet0']) != 1:
-                    chk_count = len(list_of_routers) - 1
+                    # Шкала — количество сетей: -1 за каждую сеть без корректного маршрута
+                    chk_count = len(list_of_networks)
                     err_count = 0
                     extrouter = dict_of_bridges_vmnames['pnet0'][1]
                     tmp_routes = []
@@ -2217,7 +2248,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         if len(tmp_routes) != len(list_of_networks) and not gre_present:
                             # print(gre_present)
                             errors['errors_noty'].append('Количество маршрутов не совпадает с количеством сетей')
-                            err_count = err_count + chk_count + 10
+                            err_count = chk_count
                         else:
                             for network in list_of_networks:
                                 tmp = 0
@@ -2237,7 +2268,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                                             tmp = 1
                                 if tmp != 1:
                                     errors['errors_noty'].append(f'Что-то не так с роутом до сети {network}')
-                                    err_count = err_count + 10
+                                    err_count = err_count + 1
                     good_count = chk_count - err_count
                     add_check('multiroutes', good_count, chk_count)
                 else:

@@ -561,6 +561,32 @@ def get_name_and_path_by_int_id(filter_str):
     log('vmanme and path_value', str(vm_name) + ' ' + str(path_value))
     return vm_name, path_value.replace('monitor.sock,server,nowait','')
 
+def get_tap_mac_map():
+    """Строит соответствие {ifname_tap: mac} по командным строкам всех qemu-процессов.
+
+    Источник — единственный вызов `ps aux`. Пары берём по общему netdev id,
+    связывая `-device ...,netdev=netN,mac=MAC` с `-netdev tap,id=netN,ifname=IFNAME`.
+    MAC приводим к нижнему регистру для сравнения с выводом `ip a` (link/ether).
+    Осиротевшие tap'ы (без процесса qemu) сюда естественно не попадают.
+    """
+    try:
+        output = subprocess.check_output(["ps", "aux"], universal_newlines=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        log('get_tap_mac_map err', e)
+        return {}
+
+    tap_mac = {}
+    for line in output.splitlines():
+        if 'qemu' not in line:
+            continue
+        # netdev id -> mac (из -device ...,netdev=netN,mac=...)
+        netid_to_mac = dict(re.findall(r'netdev=(\w+),mac=([0-9a-fA-F:]{17})', line))
+        # netdev id -> ifname (из -netdev tap,id=netN,ifname=...)
+        for netid, ifname in re.findall(r'id=(\w+),ifname=([^,]+)', line):
+            if netid in netid_to_mac:
+                tap_mac[ifname] = netid_to_mac[netid].lower()
+    return tap_mac
+
 def start_bridge():
 
     bridges = parse_brctl_show()
@@ -1298,6 +1324,8 @@ async def ping():
                 answer['dict_of_name_and_path'] = str(dict_of_name_and_path)
                 answer['bridges'] = str(bridges)
                 answer['dict_of_vmname_and_uid'] = dict_of_vmname_and_uid
+                dict_of_intname_and_mac = get_tap_mac_map()
+                answer['dict_of_intname_and_mac'] = dict_of_intname_and_mac
                 for namenode in dict_of_name_and_ostype:
                     if dict_of_name_and_ostype[namenode] == 'proxmox':
                         dict_of_name_and_ostype[namenode] = 'linux'
@@ -1514,47 +1542,32 @@ async def ping():
                                     linux_ints[current_interface]["ipv4"].extend(ip_with_mask)
                         dict_of_name_and_ostype['debug'] = linux_ints
 
-                        if name != 'Scan':
-                            for intname in dict_of_name_and_intname[name]:
-                                # Получаем индекс (0, 1, 2...) из имени вида vunl350_0
-                                try:
-                                    idx = int(intname.split('_')[1])
-                                except (IndexError, ValueError):
-                                    idx = 0 
+                        # Обратная карта: MAC -> имя интерфейса гостя (из вывода `ip a`).
+                        # Заменяет угадывание имён (ens3+idx / ens3f{idx} / eth0 для Scan) —
+                        # имя интерфейса ищем по MAC из командной строки qemu.
+                        mac_to_guestif = {
+                            data['mac'].lower(): ifname
+                            for ifname, data in linux_ints.items()
+                            if data['mac']
+                        }
 
-                                # --- ЛОГИКА ФОРМИРОВАНИЯ ИМЕНИ ---
-                                if 'pve' in name.lower():
-                                    # Для Proxmox: ens3f0, ens3f1...
-                                    ens = f'ens3f{idx}'
-                                else:
-                                    # Стандартная логика: ens3, ens4... (сдвиг +3)
-                                    ens = f'ens{idx + 3}'
+                        for intname in dict_of_name_and_intname[name]:
+                            tap_mac = dict_of_intname_and_mac.get(intname, '').lower()
+                            guest_if = mac_to_guestif.get(tap_mac)
+                            if not guest_if:
+                                # MAC tap'а не нашёлся среди интерфейсов гостя — fallback
+                                log('mac match not found', f'{name} {intname} mac={tap_mac}')
+                                dict_of_intnames_ipaddr[intname] = "NONE"
+                                continue
 
-                                # --- ПРОВЕРКИ СТАТУСА ---
-                                # Внимание: Если ens (например, 'ens3f0') нет в linux_ints,
-                                # следующая строка вызовет KeyError!
-                                if linux_ints[ens]['state'] == 'DOWN':
-                                    dict_of_intnames_ipaddr[intname] = "DOWN"
-                                elif len(linux_ints[ens]['ipv4']) == 0:
-                                    dict_of_intnames_ipaddr[intname] = "NONE"
-                                elif len(linux_ints[ens]['ipv4']) > 1 and not gre_present:
-                                    dict_of_intnames_ipaddr[intname] = "MULTI"
-                                else:
-                                    dict_of_intnames_ipaddr[intname] = linux_ints[ens]['ipv4'][0]
-
-                        else:
-                            # Блок для Scan
-                            for intname in dict_of_name_and_intname[name]:
-                                ens = 'eth0'
-                                # Тут тоже убрали проверку, если она была не нужна
-                                if linux_ints[ens]['state'] == 'DOWN':
-                                    dict_of_intnames_ipaddr[intname] = "DOWN"
-                                elif len(linux_ints[ens]['ipv4']) == 0:
-                                    dict_of_intnames_ipaddr[intname] = "NONE"
-                                elif len(linux_ints[ens]['ipv4']) > 1:
-                                    dict_of_intnames_ipaddr[intname] = "MULTI"
-                                else:
-                                    dict_of_intnames_ipaddr[intname] = linux_ints[ens]['ipv4'][0]
+                            if linux_ints[guest_if]['state'] == 'DOWN':
+                                dict_of_intnames_ipaddr[intname] = "DOWN"
+                            elif len(linux_ints[guest_if]['ipv4']) == 0:
+                                dict_of_intnames_ipaddr[intname] = "NONE"
+                            elif len(linux_ints[guest_if]['ipv4']) > 1 and not gre_present:
+                                dict_of_intnames_ipaddr[intname] = "MULTI"
+                            else:
+                                dict_of_intnames_ipaddr[intname] = linux_ints[guest_if]['ipv4'][0]
 
 
 

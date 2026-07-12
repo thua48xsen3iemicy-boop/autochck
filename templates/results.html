@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Результаты проверок</title>
+<style>
+  :root {
+    --bg: #f4f6f8; --card: #ffffff; --ink: #1c2733; --muted: #6b7785;
+    --line: #e2e8f0; --ok: #1a9d54; --bad: #d23f3f; --warn: #c47f0a;
+    --accent: #2563eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 24px 16px 64px; }
+  header.top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  header.top h1 { font-size: 22px; margin: 0; }
+  header.top .meta { color: var(--muted); font-size: 13px; }
+  .notice { background: #fff6e5; border: 1px solid #f0d089; color: #7a5405; padding: 12px 14px; border-radius: 10px; margin-bottom: 20px; }
+  .notice.err { background: #fdeaea; border-color: #f0a9a9; color: #8a2020; }
+  .empty { color: var(--muted); }
+
+  .lab { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px 18px 8px; margin-bottom: 18px; }
+  .lab-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .lab-head h2 { font-size: 16px; margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); word-break: break-all; }
+  .badges { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .badge { font-size: 13px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
+  .score { font-weight: 600; }
+  .grade { font-weight: 600; }
+  .grade-5 { background: #e6f6ec; color: var(--ok); border-color: #b6e3c6; }
+  .grade-4 { background: #eef7e6; color: #4c8a1a; border-color: #cfe6ac; }
+  .grade-3 { background: #fff6e5; color: var(--warn); border-color: #f0d089; }
+  .grade-2 { background: #fdeaea; color: var(--bad); border-color: #f0a9a9; }
+  .done.ok { background: #e6f6ec; color: var(--ok); border-color: #b6e3c6; }
+  .done { color: var(--muted); }
+  .ts { color: var(--muted); font-size: 12px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .checks th, .checks td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  .checks th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  .checks td:last-child, .checks th:last-child { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .row-ok td:last-child { color: var(--ok); }
+  .row-bad td:last-child { color: var(--bad); font-weight: 600; }
+  .row-zero td { color: var(--muted); }
+
+  .errors { margin: 14px 0 6px; background: #fdf3f3; border: 1px solid #f2cccc; border-radius: 10px; padding: 10px 14px; }
+  .errors-title { font-weight: 600; color: #8a2020; margin-bottom: 4px; }
+  .errors ul { margin: 4px 0 0; padding-left: 18px; }
+  .errors li { color: #7a2b2b; }
+
+  details.history { margin: 12px 0 10px; }
+  details.history summary { cursor: pointer; color: var(--accent); font-size: 14px; padding: 4px 0; }
+  .attempts th, .attempts td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .attempts th { color: var(--muted); font-weight: 500; }
+  .attempts td { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>Результаты проверок</h1>
+    <div class="meta">Студент: <b>{{ username }}</b>{% if clientip and clientip != 'False' %} · IP: {{ clientip }}{% endif %}</div>
+  </header>
+
+  {% if notice %}
+  <div class="notice{% if status == 'err' %} err{% endif %}">{{ notice }}</div>
+  {% endif %}
+
+  {% if not labs %}
+  <p class="empty">Пока нет ни одной проверки. Запустите проверку открытой лабораторной работы.</p>
+  {% endif %}
+
+  {% for lab in labs %}
+  {% set latest = lab.latest %}
+  <section class="lab">
+    <div class="lab-head">
+      <h2>{{ lab.lab_path }}</h2>
+      <div class="badges">
+        <span class="badge score">{{ latest.score }} / {{ latest.max_score }}</span>
+        {% if latest.grade is not none %}<span class="badge grade grade-{{ latest.grade }}">Оценка: {{ latest.grade }}</span>{% endif %}
+        {% if latest.lab_done %}<span class="badge done ok">Сдано</span>{% else %}<span class="badge done">Не сдано</span>{% endif %}
+        <span class="ts">{{ latest.ts }}</span>
+      </div>
+    </div>
+
+    <table class="checks">
+      <thead><tr><th>Проверка</th><th>Баллы</th></tr></thead>
+      <tbody>
+      {% for it in latest['items'] %}
+        <tr class="{% if it.max == 0 %}row-zero{% elif it.score == it.max %}row-ok{% else %}row-bad{% endif %}">
+          <td>{{ it.name }}</td>
+          <td>{{ it.score }} / {{ it.max }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    {% if latest['errors'] %}
+    <div class="errors">
+      <div class="errors-title">Замечания</div>
+      <ul>
+      {% for e in latest['errors'] %}<li>{{ e }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    {% if lab.attempts|length > 1 %}
+    <details class="history">
+      <summary>История попыток — {{ lab.attempts|length }}</summary>
+      <table class="attempts">
+        <thead><tr><th>Время</th><th>Баллы</th><th>%</th><th>Оценка</th><th>Статус</th></tr></thead>
+        <tbody>
+        {% for a in lab.attempts %}
+          <tr>
+            <td>{{ a.ts }}</td>
+            <td>{{ a.score }} / {{ a.max_score }}</td>
+            <td>{{ a.percent }}</td>
+            <td>{{ a.grade if a.grade is not none else '—' }}</td>
+            <td>{% if a.lab_done %}Сдано{% else %}—{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </details>
+    {% endif %}
+  </section>
+  {% endfor %}
+</div>
+</body>
+</html>

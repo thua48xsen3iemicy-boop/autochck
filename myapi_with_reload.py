@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="/pnet/report-stu/static"), name="static")
+# Шаблоны версионируются в репозитории в templates/ и деплоятся сюда на appliance.
+# results.html (дашборд студента) должен лежать в /pnet/report-stu/templates.
 templates = Jinja2Templates(directory="/pnet/report-stu/templates")
 no_run = False
 force = False
@@ -136,6 +138,42 @@ def save_run(run, checks, db_path=RESULT_DB_PATH):
         return run_id
     finally:
         conn.close()
+
+def load_dashboard(db_path=RESULT_DB_PATH):
+    """Читает историю прогонов для дашборда: список лаб, внутри — попытки (новые первыми).
+
+    Возвращает [{"lab_path", "attempts": [...], "latest": {...}}], где каждая
+    попытка содержит поля runs + распарсенные errors и разбивку items.
+    Блокирующая функция — вызывать через run_in_executor.
+    """
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        runs = [dict(r) for r in conn.execute(
+            "SELECT * FROM runs ORDER BY lab_path, id DESC")]
+        items_by_run = {}
+        for it in conn.execute("SELECT run_id, name, score, max FROM check_items ORDER BY id"):
+            items_by_run.setdefault(it['run_id'], []).append(
+                {'name': it['name'], 'score': it['score'], 'max': it['max']})
+    finally:
+        conn.close()
+
+    labs = {}
+    for r in runs:
+        r['items'] = items_by_run.get(r['id'], [])
+        try:
+            r['errors'] = json.loads(r['errors_json']) if r['errors_json'] else []
+        except (ValueError, TypeError):
+            r['errors'] = []
+        labs.setdefault(r['lab_path'], []).append(r)
+
+    result = [{'lab_path': lp, 'attempts': att, 'latest': att[0]}
+              for lp, att in labs.items()]
+    # Лабы с самой свежей попыткой — вверх
+    result.sort(key=lambda l: l['latest']['id'], reverse=True)
+    return result
 
 def cidr_to_network_mask(cidr: str) -> str:
     """
@@ -1255,52 +1293,34 @@ async def openlab():
     else:
         return None
 
+async def render_dashboard(request: Request, notice=None, status=None):
+    """Общий рендер дашборда результатов из SQLite."""
+    loop = asyncio.get_event_loop()
+    labs = await loop.run_in_executor(None, load_dashboard)
+    return templates.TemplateResponse("results.html", {
+        "request": request,
+        "labs": labs,
+        "username": username,
+        "clientip": str(clientip),
+        "notice": notice,
+        "status": status,
+    })
+
+@app.get("/results", response_class=HTMLResponse)
+async def results(request: Request):
+    return await render_dashboard(request)
+
+# /report оставлен как алиас на новый дашборд ради старых ссылок
 @app.get("/report", response_class=HTMLResponse)
 async def read_report(request: Request):
-    students = []
-    try_history = []
-    dbgres = []
-    scoresumm = {}
-    trysumm = {}
-    list_of_results = read_json_file('/data/result.json')
-    
-    if list_of_results is not None or 'ERRR' not in list_of_results:
-        for result in list_of_results:
-            if result['lab_path'] != 'Нет открытой лабы':
-                dbgres.append(result['lab_path'])
-        list_of_labs = list(dict.fromkeys(dbgres))    
-        for lab in list_of_labs:
-            tmpdict = {}
-            for result in list_of_results:
-                if result['status'] == '200' and result['lab_path'] == lab:
-                    trycount = 0
-                    trycountstop = 0
-                    score = 0
-                    maxscore = 0
-                    for line in result.values():
-                        if ' / ' in line:
-                            line = line.replace(' ', '')
-                            sample = line.split('/')
-                            score = score + int(sample[0])
-                            maxscore = maxscore + int(sample[1])
-                            scoresumm['score'] = f'{score}/{maxscore}'
-                    try_time = result['time']
-                    if result['lab_done'] == 'no':
-                        trycount = trycount + 1
-                        try_history.append(f'{try_time} : {score}/{maxscore} <br>')
-                    tmpdict['try_history'] = try_history
-                    result.update(scoresumm)
-                    result.update(tmpdict)
-                    students.append(result)
-    return templates.TemplateResponse("report.html", {"request": request, "students": students})
-    #return str(list(dict.fromkeys(dbgres)))
+    return await render_dashboard(request)
 
 linux_full_cmd = 'echo SSHD ===START;systemctl status ssh|grep -c "Active: active (running)";echo DNSSERVER ===START;systemctl status named|grep -c "Active: active (running)";echo IPADDR ===START;ip a;echo IPROUTE ===START;ip r;echo HOSTNAME ===START;hostname;echo FORWARDING ===START;sysctl net.ipv4.ip_forward;echo DNSCLI ===START;command -v resolvectl >/dev/null && resolvectl status | awk "/Current DNS Server/ {print \"nameserver \" \$NF}" || cat /etc/resolv.conf;echo NFTSERVICE ===START;systemctl status nftables;echo DHCPDINSTALL ===START;dpkg -l |grep -c isc-dhcp-server;echo DHCPDRUN ===START;systemctl status isc-dhcp-server |grep -c "Active: active (running)"'
 win_full_cmd = 'chcp 65001 & echo IPADDR ===START & ipconfig & echo IPROUTE ===START & route print -4 & echo HOSTNAME ===START & hostname & echo DNSCLI ===START & netsh interface ipv4 show dns'
 #linux_full_cmd = 'echo DNSSERVER ===START;systemctl status named;echo IPADDR ===START;ip a;echo IPROUTE ===START;ip r;echo HOSTNAME ===START;hostname;echo FORWARDING ===START;sysctl net.ipv4.ip_forward;echo DNSCLI ===START;cat /etc/resolv.conf;echo NFTSERVICE ===START;systemctl status nftables;echo DHCPDINSTALL ===START;dpkg -l |grep -c isc-dhcp-server'
 linux_nftrules_cmd = 'nft list ruleset'
 @app.get("/ping")
-async def ping():
+async def ping(request: Request, fmt: str = Query('auto')):
     try:
         current_time = datetime.now()
         formatted_time = current_time.strftime("%d.%m.%Y %H:%M")
@@ -1313,7 +1333,9 @@ async def ping():
             forwebresult = {}
             forwebresult.update(answer)
 
-            return forwebresult
+            if username in admin_list or fmt == 'json':
+                return forwebresult
+            return await render_dashboard(request, notice='Проверка уже выполняется, подождите…', status='err')
         else:
             print('____________________CREATE LOCK FILE')
             open('/tmp/chk.lock', 'a').close()
@@ -2464,9 +2486,7 @@ async def ping():
         forFileResult.pop('dict_of_intnames_network', None)
         forFileResult.pop('bridges', None)
         forFileResult.pop('mikrotik_raw_output', None)
-        with open("/data/result.json", "a") as file:
-                #json.dump(forwebresult, file)
-                file.write(json.dumps(forFileResult, ensure_ascii=False) + '\n')
+        # Результаты теперь в SQLite (см. save_run ниже); forFileResult идёт в debug_json.
         print('start def final return')
         
         selected_names = ["lab_path", "status", "username", "time", "errors_noty", "errorinfo"]
@@ -2506,10 +2526,16 @@ async def ping():
             except Exception as e:
                 log('save_run err', e)
 
-        if username != "i.kushch":
-            return selected_students
-        else:
+        # Возврат: админам (и по ?fmt=json) — JSON для дебага, студенту — UI.
+        if username in admin_list:
             return selected_students, forwebresult
+        if fmt == 'json':
+            return selected_students
+
+        notice = None
+        if answer['status'] != '200':
+            notice = answer.get('errorinfo') or forweb.get('lab_path')
+        return await render_dashboard(request, notice=notice, status=answer['status'])
 
 
     except Exception:

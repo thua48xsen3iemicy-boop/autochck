@@ -25,16 +25,19 @@
 
   .cards { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 22px; }
   .card {
-    display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
-    min-width: 92px; padding: 8px 12px; border-radius: 12px; cursor: pointer;
-    border: 1px solid transparent; color: #fff; font: inherit; text-align: left;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+    min-width: 108px; padding: 10px 14px; border-radius: 12px; cursor: pointer;
+    border: none; color: #fff; font: inherit; text-align: left;
     transition: transform .05s ease, box-shadow .1s ease;
   }
   .card:hover { transform: translateY(-1px); }
   .card.done { background: var(--ok); }
   .card.fail { background: var(--bad); }
-  .card-name { font-weight: 600; font-size: 15px; }
-  .card-grade { font-size: 12px; opacity: .9; }
+  .card-name { font-weight: 700; font-size: 16px; color: #fff; line-height: 1.1; }
+  .card-grade {
+    font-size: 12px; font-weight: 600; color: #fff;
+    background: rgba(0,0,0,.22); padding: 2px 9px; border-radius: 999px;
+  }
   .card.active { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--ink); }
 
   .lab { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px 18px 8px; margin-bottom: 18px; }
@@ -109,6 +112,8 @@
     </div>
     {% endif %}
 {% endmacro %}
+{# По умолчанию открыта первая (самая свежая / текущая) лаба, даже если бэкенд не прислал sel_index #}
+{% set sel_index = sel_index if sel_index is defined else 0 %}
 <div class="wrap">
   <header class="top">
     <h1>Результаты проверок</h1>
@@ -126,11 +131,12 @@
   {% if labs %}
   <div class="cards">
     {% for lab in labs %}
+    {% set lab_name = lab.name|default(lab.lab_path.rsplit('/', 1)[-1].rsplit('.', 1)[0], true) %}
     <button type="button" id="card-{{ loop.index0 }}"
             class="card {{ 'done' if lab.latest.lab_done else 'fail' }}{{ ' active' if loop.index0 == sel_index else '' }}"
             onclick="showLab({{ loop.index0 }})">
-      <span class="card-name">{{ lab.name }}</span>
-      <span class="card-grade">{{ lab.latest.grade if lab.latest.grade is not none else '—' }}</span>
+      <span class="card-name">{{ lab_name }}</span>
+      <span class="card-grade">Оценка: {{ lab.latest.grade if lab.latest.grade is not none else '—' }}</span>
     </button>
     {% endfor %}
   </div>

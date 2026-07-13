@@ -210,11 +210,14 @@
     if (!container) return;
     var cards = Array.prototype.slice.call(container.querySelectorAll('.card'));
     cards.sort(function(a, b) {
+      var nameCmp = function(x, y) {
+        return x.dataset.name.localeCompare(y.dataset.name, 'ru', { numeric: true, sensitivity: 'base' });
+      };
       if (mode === 'name') {
-        return a.dataset.name.localeCompare(b.dataset.name, 'ru', { sensitivity: 'base' });
+        return nameCmp(a, b);
       } else if (mode === 'grade') {
         var d = parseInt(a.dataset.grade, 10) - parseInt(b.dataset.grade, 10);
-        return d !== 0 ? d : a.dataset.name.localeCompare(b.dataset.name, 'ru', { sensitivity: 'base' });
+        return d !== 0 ? d : nameCmp(a, b);
       }
       return parseInt(a.dataset.order, 10) - parseInt(b.dataset.order, 10);
     });

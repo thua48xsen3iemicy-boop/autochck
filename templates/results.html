@@ -23,6 +23,15 @@
   .notice.err { background: #fdeaea; border-color: #f0a9a9; color: #8a2020; }
   .empty { color: var(--muted); }
 
+  .sortbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .sortlabel { color: var(--muted); font-size: 13px; margin-right: 2px; }
+  .sortbtn {
+    font: inherit; font-size: 13px; padding: 4px 11px; border-radius: 999px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink);
+  }
+  .sortbtn:hover { border-color: var(--accent); }
+  .sortbtn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
   .cards { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 22px; }
   .card {
     display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
@@ -129,11 +138,19 @@
   {% endif %}
 
   {% if labs %}
+  <div class="sortbar">
+    <span class="sortlabel">Сортировка:</span>
+    <button type="button" class="sortbtn active" onclick="sortCards('recent', this)">Недавние</button>
+    <button type="button" class="sortbtn" onclick="sortCards('name', this)">Имя</button>
+    <button type="button" class="sortbtn" onclick="sortCards('grade', this)">Оценка</button>
+  </div>
   <div class="cards">
     {% for lab in labs %}
     {% set lab_name = lab.name|default(lab.lab_path.rsplit('/', 1)[-1].rsplit('.', 1)[0], true) %}
     <button type="button" id="card-{{ loop.index0 }}"
             class="card {{ 'done' if lab.latest.lab_done else 'fail' }}{{ ' active' if loop.index0 == sel_index else '' }}"
+            data-order="{{ loop.index0 }}" data-name="{{ lab_name }}"
+            data-grade="{{ lab.latest.grade if lab.latest.grade is not none else 99 }}"
             onclick="showLab({{ loop.index0 }})">
       <span class="card-name">{{ lab_name }}</span>
       <span class="card-grade">Оценка: {{ lab.latest.grade if lab.latest.grade is not none else '—' }}</span>
@@ -181,8 +198,29 @@
   function showLab(i) {
     var labs = document.querySelectorAll('.lab');
     for (var k = 0; k < labs.length; k++) { labs[k].style.display = (k === i) ? '' : 'none'; }
+    // Подсветку матчим по data-order, а не по позиции — карточки могли переставиться сортировкой
     var cards = document.querySelectorAll('.card');
-    for (var k = 0; k < cards.length; k++) { cards[k].classList.toggle('active', k === i); }
+    for (var k = 0; k < cards.length; k++) {
+      cards[k].classList.toggle('active', parseInt(cards[k].dataset.order, 10) === i);
+    }
+  }
+
+  function sortCards(mode, btn) {
+    var container = document.querySelector('.cards');
+    if (!container) return;
+    var cards = Array.prototype.slice.call(container.querySelectorAll('.card'));
+    cards.sort(function(a, b) {
+      if (mode === 'name') {
+        return a.dataset.name.localeCompare(b.dataset.name, 'ru', { sensitivity: 'base' });
+      } else if (mode === 'grade') {
+        var d = parseInt(a.dataset.grade, 10) - parseInt(b.dataset.grade, 10);
+        return d !== 0 ? d : a.dataset.name.localeCompare(b.dataset.name, 'ru', { sensitivity: 'base' });
+      }
+      return parseInt(a.dataset.order, 10) - parseInt(b.dataset.order, 10);
+    });
+    cards.forEach(function(c) { container.appendChild(c); });
+    var btns = document.querySelectorAll('.sortbtn');
+    for (var i = 0; i < btns.length; i++) { btns[i].classList.toggle('active', btns[i] === btn); }
   }
 </script>
 </body>

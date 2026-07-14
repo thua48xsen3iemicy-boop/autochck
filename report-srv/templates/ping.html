@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Онлайн студентов</title>
+<style>
+  :root {
+    --bg: #f4f6f8; --card: #ffffff; --ink: #1c2733; --muted: #6b7785;
+    --line: #e2e8f0; --ok: #1a9d54; --bad: #d23f3f; --accent: #2563eb;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 20px; }
+  .empty { color: var(--muted); }
+  .tablewrap { overflow-x: auto; background: var(--card);
+    border: 1px solid var(--line); border-radius: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 8px 12px; border-bottom: 1px solid var(--line); text-align: left;
+    vertical-align: top; }
+  thead th { color: var(--muted); font-weight: 500; font-size: 12px;
+    text-transform: uppercase; letter-spacing: .03em; }
+  tbody tr:hover td { background: #f8fafc; }
+  .off { color: var(--bad); }
+  .on { color: var(--ok); }
+  .score { font-variant-numeric: tabular-nums; }
+  .extra { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Онлайн студентов</h1>
+  {% if not students %}
+    <p class="empty">Нет данных. Откройте /ping/&lt;группа&gt; или /info/&lt;группа&gt;.</p>
+  {% else %}
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Студент</th><th>Статус</th><th>Баллы</th><th>Детали</th></tr>
+        </thead>
+        <tbody>
+          {% for s in students %}
+          <tr>
+            <td>{{ s.username }}</td>
+            <td class="{% if s.status == 'Не подключен' %}off{% else %}on{% endif %}">
+              {{ s.status if s.status is defined else '—' }}</td>
+            <td class="score">{{ s.score if s.score is defined else '' }}</td>
+            <td class="extra">
+              {%- for k, v in s.items() if k not in ['username', 'status', 'score'] -%}
+                {{ k }}: {{ v }}{% if not loop.last %}<br>{% endif %}
+              {%- endfor -%}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+</body>
+</html>

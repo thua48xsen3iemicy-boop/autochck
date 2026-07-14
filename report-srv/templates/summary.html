@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сводная по группе</title>
+<style>
+  :root {
+    --bg: #f4f6f8; --card: #ffffff; --ink: #1c2733; --muted: #6b7785;
+    --line: #e2e8f0; --ok: #1a9d54; --bad: #d23f3f; --warn: #c47f0a;
+    --accent: #2563eb;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 16px 64px; }
+  header.top { display: flex; align-items: baseline; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  header.top h1 { font-size: 22px; margin: 0; }
+  header.top .meta { color: var(--muted); font-size: 13px; }
+
+  form.filters { background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 16px 18px; margin-bottom: 22px; }
+  .filters .field { margin-bottom: 12px; }
+  .filters label.lbl { display: block; color: var(--muted); font-size: 12px;
+    text-transform: uppercase; letter-spacing: .03em; margin-bottom: 6px; }
+  select { font: inherit; padding: 7px 10px; border-radius: 9px;
+    border: 1px solid var(--line); background: #fff; color: var(--ink); min-width: 200px; }
+  .labs { display: flex; flex-wrap: wrap; gap: 8px; }
+  .labs label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+    padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line);
+    background: #fff; cursor: pointer; }
+  .labs input { accent-color: var(--accent); }
+  .actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  button, .btn { font: inherit; font-size: 14px; padding: 7px 16px; border-radius: 9px;
+    border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  .btn.ghost { background: #fff; color: var(--accent); }
+
+  .empty { color: var(--muted); }
+  .tablewrap { overflow-x: auto; background: var(--card);
+    border: 1px solid var(--line); border-radius: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: center;
+    white-space: nowrap; }
+  thead th { position: sticky; top: 0; background: var(--card); z-index: 2;
+    color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .03em; }
+  th.stud, td.stud { text-align: left; position: sticky; left: 0; background: var(--card);
+    z-index: 1; font-weight: 600; }
+  thead th.stud { z-index: 3; }
+  tbody tr:hover td { background: #f8fafc; }
+  tbody tr:hover td.stud { background: #eef2f7; }
+
+  .cell { display: inline-flex; flex-direction: column; align-items: center; gap: 2px; }
+  .g { font-weight: 700; min-width: 22px; padding: 1px 8px; border-radius: 999px;
+    display: inline-block; }
+  .g5 { background: #e6f6ec; color: var(--ok); border: 1px solid #b6e3c6; }
+  .g4 { background: #eef7e6; color: #4c8a1a; border: 1px solid #cfe6ac; }
+  .g3 { background: #fff6e5; color: var(--warn); border: 1px solid #f0d089; }
+  .g2 { background: #fdeaea; color: var(--bad); border: 1px solid #f0a9a9; }
+  .sc { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .none { color: #c2cad3; }
+  .done-dot { color: var(--ok); font-size: 11px; }
+  td.total { font-weight: 700; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>Сводная по группе</h1>
+    <div class="meta">
+      {% if selected_group %}{{ selected_group }} · студентов: {{ rows|length }}{% endif %}
+    </div>
+  </header>
+
+  <form class="filters" method="get" action="/summary">
+    <div class="field">
+      <label class="lbl" for="group">Группа</label>
+      <select id="group" name="group" onchange="this.form.submit()">
+        <option value="">— выберите группу —</option>
+        {% for g in groupdirs %}
+          <option value="{{ g }}" {% if g == selected_group %}selected{% endif %}>{{ g }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    {% if all_labs %}
+    <div class="field">
+      <label class="lbl">Лабы на проверку</label>
+      <div class="labs">
+        {% for lab in all_labs %}
+          <label>
+            <input type="checkbox" name="labs" value="{{ lab }}"
+              {% if lab in selected_labs %}checked{% endif %}>
+            {{ lab }}
+          </label>
+        {% endfor %}
+      </div>
+      <div class="actions">
+        <button type="submit">Показать</button>
+        <button type="button" class="btn ghost" onclick="toggleAll(this.form)">Все / ничего</button>
+      </div>
+    </div>
+    {% endif %}
+  </form>
+
+  {% if not selected_group %}
+    <p class="empty">Выберите группу, чтобы увидеть сводную таблицу.</p>
+  {% elif not rows %}
+    <p class="empty">Нет данных по студентам этой группы.</p>
+  {% else %}
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th class="stud">Студент</th>
+            {% for lab in selected_labs %}<th>{{ lab }}</th>{% endfor %}
+            <th>Итого</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr>
+            <td class="stud">{{ r.name }}</td>
+            {% for lab in selected_labs %}
+              {% set c = r.cells[lab] %}
+              <td>
+                {% if c %}
+                  <span class="cell">
+                    <span class="g g{{ c.grade if c.grade in [2,3,4,5] else 2 }}">{{ c.grade if c.grade is not none else '—' }}</span>
+                    <span class="sc">{{ c.score }}/{{ c.max }}
+                      {%- if c.count > 1 %} · {{ c.count }}п{% endif %}
+                      {%- if c.done %} <span class="done-dot">✓</span>{% endif %}</span>
+                  </span>
+                {% else %}
+                  <span class="none">—</span>
+                {% endif %}
+              </td>
+            {% endfor %}
+            <td class="total">{{ r.total }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+
+<script>
+  function toggleAll(form) {
+    var boxes = form.querySelectorAll('input[name="labs"]');
+    var anyOff = Array.prototype.some.call(boxes, function (b) { return !b.checked; });
+    boxes.forEach(function (b) { b.checked = anyOff; });
+  }
+</script>
+</body>
+</html>

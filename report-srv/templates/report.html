@@ -44,18 +44,67 @@
   .g3 { background: #fff6e5; color: var(--warn); border-color: #f0d089; }
   .g2 { background: #fdeaea; color: var(--bad); border-color: #f0a9a9; }
   .muted { color: var(--muted); }
+  .ts { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
   details.history { margin-top: 10px; }
-  details.history > summary { cursor: pointer; color: var(--accent); font-size: 14px; }
-  .history ul { margin: 8px 0 0; padding-left: 18px; }
-  .history li { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
-    color: var(--ink); }
-  .errors { margin-top: 10px; background: #fdf3f3; border: 1px solid #f2cccc;
+  details.history > summary { cursor: pointer; color: var(--accent); font-size: 14px;
+    padding: 4px 0; }
+
+  details.attempt { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0;
+    background: #fbfcfd; }
+  details.attempt > summary { cursor: pointer; list-style: none; padding: 8px 12px;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  details.attempt > summary::-webkit-details-marker { display: none; }
+  details.attempt > summary::before { content: "▸"; color: var(--muted); font-size: 12px; }
+  details.attempt[open] > summary::before { content: "▾"; }
+  details.attempt[open] > summary { border-bottom: 1px solid var(--line); }
+
+  table.checks { width: calc(100% - 24px); margin: 8px 12px; border-collapse: collapse;
+    font-size: 14px; }
+  .checks th, .checks td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  .checks th { color: var(--muted); font-weight: 500; font-size: 12px;
+    text-transform: uppercase; letter-spacing: .03em; }
+  .checks td:last-child, .checks th:last-child { text-align: right; white-space: nowrap;
+    font-variant-numeric: tabular-nums; }
+  .row-ok td:last-child { color: var(--ok); }
+  .row-bad td:last-child { color: var(--bad); font-weight: 600; }
+  .row-zero td { color: var(--muted); }
+  .row-penalty td { color: var(--bad); font-weight: 600; background: #fdf3f3; }
+
+  .errors { margin: 8px 12px; background: #fdf3f3; border: 1px solid #f2cccc;
     border-radius: 10px; padding: 8px 12px; }
+  .errors-title { font-weight: 600; color: #8a2020; margin-bottom: 4px; }
   .errors ul { margin: 4px 0 0; padding-left: 18px; }
   .errors li { color: #7a2b2b; }
 </style>
 </head>
 <body>
+{# Детальная разбивка одной попытки: баллы по проверкам, штрафы, замечания #}
+{% macro detail(a) %}
+  <table class="checks">
+    <thead><tr><th>Проверка</th><th>Баллы</th></tr></thead>
+    <tbody>
+    {% for it in a['items'] %}
+      <tr class="{% if it.max == 0 %}row-zero{% elif it.score == it.max %}row-ok{% else %}row-bad{% endif %}">
+        <td>{{ it.name }}</td>
+        <td>{{ it.score }} / {{ it.max }}</td>
+      </tr>
+    {% endfor %}
+    {% for pname, p in a['penalties'].items() %}
+      <tr class="row-penalty">
+        <td>{{ pname }} (штраф)</td>
+        <td>−{{ p.points if p.points is defined else p }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if a['errors'] %}
+  <div class="errors">
+    <div class="errors-title">Замечания</div>
+    <ul>{% for e in a['errors'] %}<li>{{ e }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+{% endmacro %}
 <div class="wrap">
   <header class="top"><h1>Отчёт по лабе</h1></header>
 
@@ -107,16 +156,22 @@
         </div>
       </div>
 
-      {% if s.errors %}
-      <div class="errors">
-        <ul>{% for e in s.errors %}<li>{{ e }}</li>{% endfor %}</ul>
-      </div>
-      {% endif %}
-
-      {% if s.history %}
+      {% if s.attempts %}
       <details class="history">
         <summary>История попыток ({{ s.trycount }})</summary>
-        <ul>{% for h in s.history %}<li>{{ h }}</li>{% endfor %}</ul>
+        {% for a in s.attempts %}
+        <details class="attempt" {% if a.is_best %}open{% endif %}>
+          <summary>
+            <span class="ts">{{ a.ts }}</span>
+            <span class="badge g g{{ a.grade if a.grade in [2,3,4,5] else 2 }}">Оценка {{ a.grade }}</span>
+            <span class="badge">{{ a.score }} / {{ a.maxscore }}</span>
+            {% if a.done %}<span class="badge g5">зачёт ✓</span>{% endif %}
+            {% if a.clientip %}<span class="badge muted">{{ a.clientip }}</span>{% endif %}
+            {% if a.is_best %}<span class="badge muted">лучшая попытка</span>{% endif %}
+          </summary>
+          {{ detail(a) }}
+        </details>
+        {% endfor %}
       </details>
       {% endif %}
     </div>

@@ -158,6 +158,13 @@ def save_run(run, checks, db_path=RESULT_DB_PATH):
             "INSERT INTO check_items (run_id, name, score, max) VALUES (?,?,?,?)",
             [(run_id, name, c['score'], c['max']) for name, c in checks.items()])
         conn.commit()
+        # Вливаем WAL в основной файл БД: сервер отчётов читает эту БД по сети
+        # через immutable=1 (нет прав писать -shm в чужом каталоге) и видит только
+        # закоммиченное в основной файл. Без чекпоинта свежие прогоны застряли бы в -wal.
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError as e:
+            log('wal_checkpoint err', e)
         return run_id
     finally:
         conn.close()

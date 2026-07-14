@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Отчёт по лабе</title>
+<style>
+  :root {
+    --bg: #f4f6f8; --card: #ffffff; --ink: #1c2733; --muted: #6b7785;
+    --line: #e2e8f0; --ok: #1a9d54; --bad: #d23f3f; --warn: #c47f0a;
+    --accent: #2563eb;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
+  header.top { display: flex; align-items: baseline; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  header.top h1 { font-size: 22px; margin: 0; }
+
+  form.filters { background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 16px 18px; margin-bottom: 22px;
+    display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+  .filters .field label.lbl { display: block; color: var(--muted); font-size: 12px;
+    text-transform: uppercase; letter-spacing: .03em; margin-bottom: 6px; }
+  select { font: inherit; padding: 7px 10px; border-radius: 9px;
+    border: 1px solid var(--line); background: #fff; color: var(--ink); min-width: 180px; }
+  button { font: inherit; font-size: 14px; padding: 8px 16px; border-radius: 9px;
+    border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+
+  .empty { color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px 18px; margin-bottom: 12px; }
+  .card-head { display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap; }
+  .who { font-weight: 600; }
+  .info { color: var(--muted); font-size: 13px; }
+  .badges { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .badge { font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line);
+    white-space: nowrap; }
+  .g { font-weight: 700; }
+  .g5 { background: #e6f6ec; color: var(--ok); border-color: #b6e3c6; }
+  .g4 { background: #eef7e6; color: #4c8a1a; border-color: #cfe6ac; }
+  .g3 { background: #fff6e5; color: var(--warn); border-color: #f0d089; }
+  .g2 { background: #fdeaea; color: var(--bad); border-color: #f0a9a9; }
+  .muted { color: var(--muted); }
+  details.history { margin-top: 10px; }
+  details.history > summary { cursor: pointer; color: var(--accent); font-size: 14px; }
+  .history ul { margin: 8px 0 0; padding-left: 18px; }
+  .history li { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+    color: var(--ink); }
+  .errors { margin-top: 10px; background: #fdf3f3; border: 1px solid #f2cccc;
+    border-radius: 10px; padding: 8px 12px; }
+  .errors ul { margin: 4px 0 0; padding-left: 18px; }
+  .errors li { color: #7a2b2b; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top"><h1>Отчёт по лабе</h1></header>
+
+  <form class="filters" method="get" action="/report">
+    <div class="field">
+      <label class="lbl" for="group">Группа</label>
+      <select id="group" name="group" onchange="this.form.submit()">
+        <option value="">— группа —</option>
+        {% for g in groupdirs %}
+          <option value="{{ g }}" {% if g == selected_group %}selected{% endif %}>{{ g }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label class="lbl" for="lab">Лаба</label>
+      <select id="lab" name="lab">
+        <option value="">— лаба —</option>
+        {% if selected_group and dict_of_labs[selected_group] %}
+          {% for lab in dict_of_labs[selected_group] %}
+            <option value="{{ lab }}" {% if lab == selected_lab %}selected{% endif %}>{{ lab }}</option>
+          {% endfor %}
+        {% endif %}
+      </select>
+    </div>
+    <div class="field"><button type="submit">Показать</button></div>
+  </form>
+
+  {% if not selected_group or not selected_lab %}
+    <p class="empty">Выберите группу и лабу.</p>
+  {% elif not students %}
+    <p class="empty">Нет данных.</p>
+  {% else %}
+    {% for s in students %}
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="who">{{ s.username }}</div>
+          <div class="info">{{ s.info }}</div>
+        </div>
+        <div class="badges">
+          {% if s.status == 'Не выполнялось' %}
+            <span class="badge muted">Не выполнялось</span>
+          {% else %}
+            <span class="badge g g{{ s.grade if s.grade in [2,3,4,5] else 2 }}">Оценка {{ s.grade }}</span>
+            <span class="badge">{{ s.score }} / {{ s.maxscore }}</span>
+            <span class="badge">попыток: {{ s.trycount }}</span>
+            {% if s.done %}<span class="badge g5">зачёт ✓</span>{% endif %}
+          {% endif %}
+        </div>
+      </div>
+
+      {% if s.errors %}
+      <div class="errors">
+        <ul>{% for e in s.errors %}<li>{{ e }}</li>{% endfor %}</ul>
+      </div>
+      {% endif %}
+
+      {% if s.history %}
+      <details class="history">
+        <summary>История попыток ({{ s.trycount }})</summary>
+        <ul>{% for h in s.history %}<li>{{ h }}</li>{% endfor %}</ul>
+      </details>
+      {% endif %}
+    </div>
+    {% endfor %}
+  {% endif %}
+</div>
+</body>
+</html>

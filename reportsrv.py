@@ -19,9 +19,11 @@
 import os
 import re
 import json
+import shutil
 import logging
 import sqlite3
 import asyncio
+import tempfile
 from typing import List, Optional
 
 import httpx
@@ -180,30 +182,59 @@ async def group_lab_names(group: str) -> List[str]:
 
 
 # ================================================================== чтение БД студента
-def _connect_read(db_path: str):
-    """Открывает БД студента для чтения. Возвращает соединение или None.
+def _read_runs_inplace(db_path: str):
+    """Пробует прочитать runs, открыв БД прямо на mount. None при неудаче.
 
-    БД студента лежит на mount с root_squash: reportsrv не имеет прав на запись
-    в каталог студента. WAL-БД (даже в mode=ro) требует создать/залочить -shm в
-    этом каталоге, поэтому обычное открытие падает с 'unable to open database
-    file'. Пробуем по очереди:
-      1) mode=ro — работает, если доступ к -shm есть или БД не в WAL;
-      2) immutable=1 — читает только основной файл БД, без -wal/-shm и без
-         блокировок (нужно, чтобы myapi чекпоинтил WAL, иначе свежие попытки
-         останутся в -wal и не будут видны).
-    Пробный SELECT нужен, потому что connect() ленивый — реальная ошибка WAL
-    вылезает лишь при первом чтении.
+    Дешёвый путь для случаев, когда mount позволяет открыть файл: сначала
+    mode=ro, затем immutable=1 (только основной файл БД, без -wal/-shm и без
+    блокировок). Если и это не срабатывает (root_squash, POSIX-локи по сети),
+    вызывающий откатывается на чтение через локальную копию.
     """
     for uri in (f"file:{db_path}?mode=ro", f"file:{db_path}?immutable=1"):
         conn = None
         try:
             conn = sqlite3.connect(uri, uri=True, timeout=5)
-            conn.execute("SELECT 1")
-            return conn
-        except sqlite3.OperationalError:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY lab_path, id")]
+        except sqlite3.DatabaseError:
+            pass
+        finally:
             if conn is not None:
                 conn.close()
     return None
+
+
+def _read_runs_via_copy(db_path: str):
+    """Копирует БД (и -wal/-shm) в локальный tmp и читает оттуда.
+
+    БД студента лежит на сетевом mount с root_squash: reportsrv не может ни
+    писать в чужой каталог, ни ставить POSIX-блокировки, которых SQLite требует
+    даже для чтения, — отсюда 'unable to open database file'. Но сам файл
+    читается (cat работает), поэтому копируем байты в локальный писабельный tmp
+    и открываем уже там — это обходит и права, и блокировки, и различия версий
+    SQLite. -wal копируем тоже, чтобы видеть ещё не зачекпойченные прогоны.
+    """
+    tmpdir = tempfile.mkdtemp(prefix='rsdb_')
+    local = os.path.join(tmpdir, 'result.db')
+    conn = None
+    try:
+        shutil.copyfile(db_path, local)
+        for suffix in ('-wal', '-shm'):
+            if os.path.exists(db_path + suffix):
+                try:
+                    shutil.copyfile(db_path + suffix, local + suffix)
+                except OSError:
+                    pass
+        conn = sqlite3.connect(local, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY lab_path, id")]
+    except (OSError, sqlite3.DatabaseError) as e:
+        logger.warning("Ошибка чтения (copy) %s: %s", db_path, e)
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _load_student_labs(db_path: str) -> dict:
@@ -215,18 +246,10 @@ def _load_student_labs(db_path: str) -> dict:
     """
     if not os.path.exists(db_path):
         return {}
-    conn = _connect_read(db_path)
-    if conn is None:
-        logger.warning("Не удалось открыть %s (нет доступа/WAL)", db_path)
-        return {}
-    conn.row_factory = sqlite3.Row
-    try:
-        runs = [dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY lab_path, id")]
-    except sqlite3.DatabaseError as e:
-        logger.warning("Ошибка чтения %s: %s", db_path, e)
-        return {}
-    finally:
-        conn.close()
+    # Сначала пробуем открыть на месте (дёшево); если mount не даёт — через копию.
+    runs = _read_runs_inplace(db_path)
+    if runs is None:
+        runs = _read_runs_via_copy(db_path)
 
     labs: dict = {}
     for r in runs:

@@ -181,16 +181,29 @@ async def group_lab_names(group: str) -> List[str]:
 
 # ================================================================== чтение БД студента
 def _connect_read(db_path: str):
-    """Открывает БД студента для чтения.
+    """Открывает БД студента для чтения. Возвращает соединение или None.
 
-    Сначала пробуем read-only. Живую WAL-БД в режиме ro не всегда удаётся
-    открыть (нужен доступ к -shm), поэтому при неудаче откатываемся на обычное
-    подключение. Данные пишутся другим процессом на стороне студента.
+    БД студента лежит на mount с root_squash: reportsrv не имеет прав на запись
+    в каталог студента. WAL-БД (даже в mode=ro) требует создать/залочить -shm в
+    этом каталоге, поэтому обычное открытие падает с 'unable to open database
+    file'. Пробуем по очереди:
+      1) mode=ro — работает, если доступ к -shm есть или БД не в WAL;
+      2) immutable=1 — читает только основной файл БД, без -wal/-shm и без
+         блокировок (нужно, чтобы myapi чекпоинтил WAL, иначе свежие попытки
+         останутся в -wal и не будут видны).
+    Пробный SELECT нужен, потому что connect() ленивый — реальная ошибка WAL
+    вылезает лишь при первом чтении.
     """
-    try:
-        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
-    except sqlite3.OperationalError:
-        return sqlite3.connect(db_path, timeout=5)
+    for uri in (f"file:{db_path}?mode=ro", f"file:{db_path}?immutable=1"):
+        conn = None
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=5)
+            conn.execute("SELECT 1")
+            return conn
+        except sqlite3.OperationalError:
+            if conn is not None:
+                conn.close()
+    return None
 
 
 def _load_student_labs(db_path: str) -> dict:
@@ -202,10 +215,9 @@ def _load_student_labs(db_path: str) -> dict:
     """
     if not os.path.exists(db_path):
         return {}
-    try:
-        conn = _connect_read(db_path)
-    except sqlite3.OperationalError as e:
-        logger.warning("Не удалось открыть %s: %s", db_path, e)
+    conn = _connect_read(db_path)
+    if conn is None:
+        logger.warning("Не удалось открыть %s (нет доступа/WAL)", db_path)
         return {}
     conn.row_factory = sqlite3.Row
     try:

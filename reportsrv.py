@@ -323,7 +323,7 @@ async def summaryinfo(request: Request,
            "all_labs": [], "selected_labs": [], "rows": []}
 
     if not group or group not in groupdirs:
-        return templates.TemplateResponse("summary.html", ctx)
+        return templates.TemplateResponse(request, "summary.html", ctx)
 
     all_labs = await group_lab_names(group)
     # Выбранные лабы (колонки). Если ничего не отмечено — показываем все.
@@ -353,7 +353,7 @@ async def summaryinfo(request: Request,
 
     rows.sort(key=lambda r: r['name'].lower())
     ctx.update({"all_labs": all_labs, "selected_labs": selected, "rows": rows})
-    return templates.TemplateResponse("summary.html", ctx)
+    return templates.TemplateResponse(request, "summary.html", ctx)
 
 
 # ================================================================== /report
@@ -368,7 +368,7 @@ async def read_report(request: Request,
            "selected_group": group, "selected_lab": lab, "students": []}
 
     if not group or group not in groupdirs or not lab:
-        return templates.TemplateResponse("report.html", ctx)
+        return templates.TemplateResponse(request, "report.html", ctx)
 
     key = lab_key(lab)
     students = await group_students(group)
@@ -400,7 +400,7 @@ async def read_report(request: Request,
 
     rows.sort(key=lambda r: r['username'].lower())
     ctx["students"] = rows
-    return templates.TemplateResponse("report.html", ctx)
+    return templates.TemplateResponse(request, "report.html", ctx)
 
 
 # ================================================================== /ping, /info
@@ -439,7 +439,7 @@ async def build_ping_rows(group: str) -> List[dict]:
 
 async def render_ping(request: Request, group: Optional[str] = None):
     students = await build_ping_rows(group) if group else []
-    return templates.TemplateResponse("ping.html", {"request": request, "students": students})
+    return templates.TemplateResponse(request, "ping.html", {"students": students})
 
 
 @app.get("/info", response_class=HTMLResponse)

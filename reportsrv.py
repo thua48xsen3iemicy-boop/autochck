@@ -182,6 +182,37 @@ async def group_lab_names(group: str) -> List[str]:
 
 
 # ================================================================== чтение БД студента
+def _fetch_runs(conn) -> list:
+    """Читает прогоны с полной детализацией из открытого соединения.
+
+    Каждый прогон дополняется разбивкой по проверкам (items), штрафами
+    (penalties) и списком замечаний (errors) — то же, что показывает дашборд
+    студента, чтобы любую попытку можно было раскрыть с этими подробностями.
+    """
+    conn.row_factory = sqlite3.Row
+    runs = [dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY lab_path, id")]
+
+    items_by_run: dict = {}
+    try:
+        for it in conn.execute("SELECT run_id, name, score, max FROM check_items ORDER BY id"):
+            items_by_run.setdefault(it['run_id'], []).append(
+                {'name': it['name'], 'score': it['score'], 'max': it['max']})
+    except sqlite3.DatabaseError:
+        pass  # старые БД без check_items
+
+    for r in runs:
+        r['items'] = items_by_run.get(r['id'], [])
+        try:
+            r['errors'] = json.loads(r['errors_json']) if r.get('errors_json') else []
+        except (ValueError, TypeError):
+            r['errors'] = []
+        try:
+            r['penalties'] = json.loads(r['penalties_json']) if r.get('penalties_json') else {}
+        except (ValueError, TypeError):
+            r['penalties'] = {}
+    return runs
+
+
 def _read_runs_inplace(db_path: str):
     """Пробует прочитать runs, открыв БД прямо на mount. None при неудаче.
 
@@ -194,8 +225,7 @@ def _read_runs_inplace(db_path: str):
         conn = None
         try:
             conn = sqlite3.connect(uri, uri=True, timeout=5)
-            conn.row_factory = sqlite3.Row
-            return [dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY lab_path, id")]
+            return _fetch_runs(conn)
         except sqlite3.DatabaseError:
             pass
         finally:
@@ -226,8 +256,7 @@ def _read_runs_via_copy(db_path: str):
                 except OSError:
                     pass
         conn = sqlite3.connect(local, timeout=5)
-        conn.row_factory = sqlite3.Row
-        return [dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY lab_path, id")]
+        return _fetch_runs(conn)
     except (OSError, sqlite3.DatabaseError) as e:
         logger.warning("Ошибка чтения (copy) %s: %s", db_path, e)
         return []
@@ -259,6 +288,7 @@ def _load_student_labs(db_path: str) -> dict:
     for key, attempts in labs.items():
         best = max(attempts, key=lambda r: ((r['score'] if r['score'] is not None else -1),
                                             (r['percent'] or 0), r['id']))
+        attempts.sort(key=lambda r: r['id'], reverse=True)  # история: новые сверху
         result[key] = {'best': best, 'attempts': attempts, 'count': len(attempts)}
     return result
 
@@ -420,17 +450,18 @@ async def read_report(request: Request,
                          'lab_path': f'/GROUPS/{group}/{lab}', 'history': [], 'trycount': 0})
             continue
         b = labinfo['best']
-        history = [f"{a['ts']} {a['score']}/{a['max_score']} {a['grade']} {a['clientip']}"
-                   for a in labinfo['attempts']]
-        try:
-            errors = json.loads(b['errors_json']) if b['errors_json'] else []
-        except (ValueError, TypeError):
-            errors = []
+        attempts = [{
+            'ts': a['ts'], 'clientip': a.get('clientip'), 'score': a['score'],
+            'maxscore': a['max_score'], 'percent': a['percent'], 'grade': a['grade'],
+            'done': bool(a['lab_done']), 'items': a['items'],
+            'penalties': a['penalties'], 'errors': a['errors'],
+            'is_best': a['id'] == b['id'],
+        } for a in labinfo['attempts']]
         rows.append({
             'username': name, 'info': info_addr, 'status': b['grade'],
             'lab_path': b['lab_path'], 'score': b['score'], 'maxscore': b['max_score'],
             'percent': b['percent'], 'grade': b['grade'], 'done': bool(b['lab_done']),
-            'trycount': labinfo['count'], 'history': history, 'errors': errors,
+            'trycount': labinfo['count'], 'errors': b['errors'], 'attempts': attempts,
         })
 
     rows.sort(key=lambda r: r['username'].lower())

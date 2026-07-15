@@ -136,6 +136,26 @@ PENALTIES = {
     'Forwarding_disable': 10,
 }
 
+# Человекочитаемые названия проверок для отчёта (внутренние ключи оставляем как есть —
+# они используются в CHECK_WEIGHTS/PENALTIES и в check_items).
+CHECK_LABELS = {
+    'Hostnames': 'Имена узлов',
+    'Ip Addresses': 'IP-адреса',
+    'Networks': 'Сети в L2-доменах',
+    'nodup_ipaddr': 'Уникальность IP-адресов',
+    'IP is private': 'Приватные адреса',
+    'Default gw present': 'Шлюз по умолчанию задан',
+    'Default gw good': 'Шлюз по умолчанию корректен',
+    'Forwarding_enable': 'Форвардинг на маршрутизаторах',
+    'Forwarding_disable': 'Форвардинг на клиентах',
+    'dnsclient_ip_addr': 'DNS-клиент',
+    'snat_nftables': 'SNAT (nftables)',
+    'Win Domain': 'Домен Windows',
+    'joined_to_domain': 'Ввод узлов в домен',
+    'multiroutes': 'Маршруты между сетями',
+    'special': 'Спецпроверки лабы',
+}
+
 def save_run(run, checks, db_path=RESULT_DB_PATH):
     """Сохраняет один прогон (runs) и разбивку по проверкам (check_items). Возвращает run_id.
 
@@ -1349,6 +1369,7 @@ async def render_dashboard(request: Request, notice=None, status=None, current_l
         "request": request,
         "labs": labs,
         "sel_index": sel_index,
+        "labels": CHECK_LABELS,
         "username": username,
         "clientip": str(clientip),
         "notice": notice,

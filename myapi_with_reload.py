@@ -966,8 +966,19 @@ IP = "127.0.0.1"
 USER_NAME = "admin"
 USER_PASS = "123"
 MTK_PROMPT = "] >"  # Пример приглашения командной строки MikroTik
+# Приглашение в любом подменю ("[admin@MikroTik] /ip address>"): если студент
+# оставил сессию не в корне меню, "] >" в потоке не встретится
+MTK_ANY_PROMPT = r'\[[^\]\r\n]+\][^\r\n]*>'
+# Маркер конца вывода скрипта опроса. В самом скрипте печатается склейкой
+# (:put ("===MTKDONE" . "===")), чтобы эхо ввода не совпало с маркером
+MTK_DONE = '===MTKDONE==='
+# Список секций скрипта опроса: при неудаче словарь секций заполняется
+# пустыми списками, чтобы дальнейшие проверки не падали на KeyError
+MTK_SECTIONS = ('DHCLI', 'IPROUTE', 'INTERFACE', 'DEFGW', 'IPADDR', 'DNS', 'FWNAT', 'HOSTNAME', 'EXPORT')
 CONTIMEOUT = 5  # Таймаут ожидания подключения
 EXPTIMEOUT = 3  # Таймаут ожидания ответа
+MTKSCRIPTTIMEOUT = 30  # Максимальное время выполнения скрипта опроса (включая /export)
+MTKLOGINTIMEOUT = 60   # Общий дедлайн процедуры входа
 
 
 cisusername = 'cisco'
@@ -989,17 +1000,35 @@ def node_quit(handler):
     ''' Отправляем команду /quit '''
     handler.sendline('/quit\r\n')
 
-def node_login(handler):
+def node_mtkclose(handler):
+    ''' Закрываем telnet-процесс (идемпотентно, безопасно для мёртвого handler) '''
+    try:
+        handler.close(force=True)
+    except Exception:
+        pass
+
+def node_login(handler, depth=0):
     ''' Отправляем пустую строку и ожидаем приглашение к входу '''
+    if depth > 2:
+        # Защита от зацикливания /quit -> повторный вход
+        return False
+    # Общий дедлайн: молчащая консоль раньше крутила этот цикл вечно,
+    # оставляя /tmp/chk.lock висеть до перезапуска сервиса
+    deadline = time.time() + MTKLOGINTIMEOUT
     i = -1
     while i == -1:
-        #print('wait prompt...')
+        if time.time() > deadline:
+            print('ERROR: mikrotik login deadline exceeded.')
+            return False
         try:
             handler.sendline('\r\n')
-            i = handler.expect(['Login:', MTK_PROMPT], timeout=CONTIMEOUT)
-            #print('PROMPT OK')
+            i = handler.expect(['Login:', MTK_PROMPT, MTK_ANY_PROMPT], timeout=CONTIMEOUT)
         except pexpect.exceptions.TIMEOUT:
-            handler.sendline('\r\n')
+            i = -1
+        except (pexpect.exceptions.EOF, OSError):
+            # Мёртвый telnet (порт не отвечает) раньше ронял всю проверку
+            print('ERROR: mikrotik console connection closed.')
+            return False
 
     if i == 0:
         # Необходимо ввести имя пользователя и пароль
@@ -1013,41 +1042,45 @@ def node_login(handler):
             return False
         handler.sendline(USER_PASS)
         handler.send('\r\n')
-        j = handler.expect(['Login:', MTK_PROMPT], timeout=CONTIMEOUT)
-        if j == 0:
+        try:
+            j = handler.expect(['Login:', MTK_PROMPT, r'\[Y/n\]'], timeout=CONTIMEOUT)
+        except (pexpect.exceptions.TIMEOUT, pexpect.exceptions.EOF):
+            # Раньше TIMEOUT здесь не ловился и исключение роняло всю проверку
+            print('ERROR: error waiting for prompt after password.')
             return False
-        else:
-            return True
-    elif i == 1:
-        # Если сессия уже открыта, отправляем /quit и повторяем процедуру входа
-        node_quit(handler)
-        return node_login(handler)
+        if j == 0:
+            # Снова Login: — пароль не подошёл
+            return False
+        if j == 2:
+            # Вопрос про просмотр лицензии при первом входе на свежем RouterOS
+            handler.sendline('n')
+            try:
+                handler.expect(MTK_PROMPT, timeout=CONTIMEOUT)
+            except (pexpect.exceptions.TIMEOUT, pexpect.exceptions.EOF):
+                print('ERROR: error waiting for prompt after license question.')
+                return False
+        return True
     else:
-        # Unexpected output
+        # Открыта чужая сессия (возможно, в подменю) — /quit и повторяем вход
         node_quit(handler)
-        handler.send('#unexpected\r\n')
-        return False
-    #return True
+        return node_login(handler, depth + 1)
 
 def config_get(handler, cmd):
-    ''' Отправляем команду /export и читаем вывод '''
+    ''' Отправляем скрипт опроса и читаем вывод до маркера завершения '''
     clear_buffer(handler)
     handler.send(cmd)
     handler.send('\r\n')
-    time.sleep(1)
 
+    # Ждать приглашение "] >" нельзя: оно встречается уже в эхе ввода, из-за
+    # чего вывод обрезался, а 3 секунд на весь скрипт с /export не хватало.
+    # Скрипт сам печатает в конце маркер MTK_DONE — ждём его.
     try:
-        handler.expect(
-            MTK_PROMPT, timeout=EXPTIMEOUT)
-    except pexpect.exceptions.TIMEOUT:
-        print('ERROR: error waiting for "end" marker.')
+        handler.expect(MTK_DONE, timeout=MTKSCRIPTTIMEOUT)
+    except (pexpect.exceptions.TIMEOUT, pexpect.exceptions.EOF):
+        print('ERROR: error waiting for script done marker.')
         node_quit(handler)
         return False
-    clear_buffer(handler)
-    _config = re.sub(r"^.*/export[\r\n]+#", "#", handler.buffer)
-    #_config = re.sub(r"^.*/export[\r\n]+#", "#", _config)
-    _config = re.sub(r"[\r\n]{2,}.+$", "\r\n\r\n", _config)
-    _config = re.sub(r"[\r\n]+", "\r\n", _config)
+    _config = handler.before
     node_quit(handler)
     log('routeros get out', _config)
     return _config
@@ -1056,12 +1089,15 @@ def config_get(handler, cmd):
 
 def run_on_routeros(cmd, port):
     handler = pexpect.spawnu(f'telnet {IP} {port}', maxread=100000)
-    if node_login(handler):
-        print("Login successful!")
-        out = config_get(handler, cmd)
-        return out
-    else:
+    try:
+        if node_login(handler):
+            print("Login successful!")
+            return config_get(handler, cmd)
         return False
+    finally:
+        # Закрываем telnet и на успехе, и на ошибке — раньше процесс
+        # оставался висеть и держал консоль
+        node_mtkclose(handler)
 
 def read_json_file(file_path):
     if not os.path.exists(file_path):
@@ -1509,8 +1545,8 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 /system identity print;
                 :put "===EXPORT START===";
                 /export;
-                } on-error={:put "ERRR";}
-                }"""
+                } on-error={:put "ERRR";};
+                :put ("===MTKDONE" . "===")"""
 
 
 
@@ -1613,10 +1649,11 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         cisco_tmp = asyncio.ensure_future(execute_command_cisco(cis_handler, name))
                         cisco_tmps.append(cisco_tmp)                       
 
-                    elif dict_of_name_and_ostype[name] == 'mikrotik':                     
+                    elif dict_of_name_and_ostype[name] == 'mikrotik':
                         tmpport = dict_of_name_and_path[name]
                         port = int(tmpport.split('/')[1]) + 30000
-                        handler = pexpect.spawnu(f'telnet {IP} {port}', maxread=100000)
+                        # run_on_routeros открывает telnet сам; лишний spawnu здесь
+                        # оставлял по неиспользуемому подключению на каждый узел
                         routeros_tmp = asyncio.ensure_future(execute_command_routeros(mikrot_script, port, name))
                         routeros_tmps.append(routeros_tmp)
                 
@@ -1641,15 +1678,23 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         elif current_section is not None:
                             script_OUT[current_section].append(outline)
                     dict_of_name_routeros_script[routeros_result[0]] = script_OUT
-                    answer['dict_of_name_routeros_script'] = dict_of_name_routeros_script                        
-                    if routeros_result:
+                    answer['dict_of_name_routeros_script'] = dict_of_name_routeros_script
+                    # Кортеж (имя, вывод) всегда истинен, поэтому прежнее условие
+                    # "if routeros_result:" не отсекало неудачный опрос: script_OUT
+                    # оставался пустым и обращение к ['EXPORT'] роняло проверку.
+                    # EXPORT — последняя секция скрипта: если она есть, скрипт дошёл
+                    # до конца и все секции гарантированно присутствуют.
+                    if script_OUT.get('EXPORT'):
 
                         dict_routeros_ints_bymac = {}
+                        # Хостнейм — первая строка "set name=" из /export; раньше
+                        # найденное значение затиралось обратно в 'NONE' каждой
+                        # следующей строкой экспорта
+                        dict_of_vmnames_hostname[routeros_result[0]] = 'NONE'
                         for line in dict_of_name_routeros_script[routeros_result[0]]['EXPORT']:
                             if 'set name=' in line:
                                 dict_of_vmnames_hostname[routeros_result[0]] = line.split('=')[1]
-                            else:
-                                dict_of_vmnames_hostname[routeros_result[0]] = 'NONE'
+                                break
                         for line in dict_of_name_routeros_script[routeros_result[0]]['INTERFACE']:
                             if mac_address_pattern.search(line.strip()):
                                 columns = line.split()
@@ -1697,9 +1742,13 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                 elif count > 1:
                                     dict_of_intnames_ipaddr[int_name_router] = "MULTI"
                     else:
+                        # Заполняем секции пустыми списками: дальше по коду они
+                        # индексируются напрямую (DEFGW, DNS, FWNAT, IPROUTE)
+                        dict_of_name_routeros_script[routeros_result[0]] = {k: [] for k in MTK_SECTIONS}
+                        dict_of_vmnames_hostname[routeros_result[0]] = 'NONE'
                         for intname in dict_of_name_and_intname[routeros_result[0]]:
                             dict_of_intnames_ipaddr[intname] = "NONE"
-                        errors['errors_noty'].append(f'Не верный пароль на {routeros_result[0]}') 
+                        errors['errors_noty'].append(f'Проблемы на {routeros_result[0]}: не удалось войти (пароль admin/123?) или прочитать вывод')
 
 
 

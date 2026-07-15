@@ -1481,6 +1481,8 @@ def build_switch_links(switch_names, dict_of_name_and_intname, bridges):
     Возвращает:
       links:    {свитч: {'GiA/B': [имена соседей по бриджу]}}
       sw_links: [(свитч1, порт1, свитч2, порт2)] — линки между свитчами
+      facing:   {узел: [(его tap, свитч, порт свитча)]} — точки подключения
+                не-свитчевых узлов к свитчам
     Номер интерфейса N из имени tap переводится в имя порта vIOS-L2
     (4 порта на модуль): N=5 -> Gi1/1.
     """
@@ -1495,18 +1497,72 @@ def build_switch_links(switch_names, dict_of_name_and_intname, bridges):
 
     links = {sw: {} for sw in switch_names}
     sw_links = []
+    facing = {}
     for ports in bridges.values():
         vunl = [p for p in ports if p.startswith('vunl') and p in tap_owner]
         sw_taps = [t for t in vunl if tap_owner[t] in switch_names]
         for tap in sw_taps:
             owner = tap_owner[tap]
+            pname = portname(tap)
             peers = [tap_owner[t] for t in vunl if t != tap]
-            links[owner][portname(tap)] = peers
+            links[owner][pname] = peers
+            for t in vunl:
+                if t != tap and tap_owner[t] not in switch_names:
+                    facing.setdefault(tap_owner[t], []).append((t, owner, pname))
         for a in range(len(sw_taps)):
             for b in range(a + 1, len(sw_taps)):
                 t1, t2 = sw_taps[a], sw_taps[b]
                 sw_links.append((tap_owner[t1], portname(t1), tap_owner[t2], portname(t2)))
-    return links, sw_links
+    return links, sw_links, facing
+
+def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
+    """Подменяет физические бриджи синтетическими VLAN-доменами по подсказке.
+
+    Бриджи, в которых участвует порт коммутатора, удаляются (это точечные
+    линки "узел-порт свитча", как широковещательные домены они бессмысленны);
+    вместо них создаётся по псевдобриджу на каждую группу подсказки:
+      - клиент попадает в домен своей группы своим tap'ом (по задуманной
+        топологии, независимо от фактического vlan порта — за фактическое
+        размещение уже наказывает vlan_membership);
+      - роутер-на-палочке — виртуальным сабинтерфейсом tap.vlanid;
+      - роутер с отдельными ногами в свитчи — тем tap'ом, чей порт свитча
+        фактически находится в vlan группы (разрешение неоднозначности).
+    Бриджи без участия свитча (p2p-линки, pnet0) сохраняются как есть.
+    """
+    switches = set(l2res['switches'])
+    switch_taps = set()
+    for sw in switches:
+        switch_taps.update(dict_of_name_and_intname.get(sw, []))
+
+    new_bridges = {}
+    for bname, ports in bridges.items():
+        if not switch_taps & set(ports):
+            new_bridges[bname] = ports
+
+    member_count = Counter(m for g in l2res['groups'] for m in g['members'])
+    for idx, g in enumerate(l2res['groups'], 1):
+        vid = g['vlan']
+        domain = f'vlan{vid}' if vid else f'vlangroup{idx}'
+        dports = []
+        for member in g['members']:
+            if member in switches:
+                continue
+            for tap, sw, pname in l2res['facing'].get(member, []):
+                subints = dict_of_subints.get(tap, {})
+                if vid and vid in subints:
+                    # роутер-на-палочке: в домен идёт сабинтерфейс нужного vlan
+                    dports.append(subints[vid])
+                elif member_count[member] > 1 and vid:
+                    # несколько ног в свитчи: берём tap, чей порт фактически
+                    # в vlan группы (access или trunk с этим vlan)
+                    data = l2res['switch_data'].get(sw, {})
+                    if pname in data.get('vlans', {}).get(vid, set()) or vid in data.get('trunks', {}).get(pname, set()):
+                        dports.append(tap)
+                else:
+                    dports.append(tap)
+        if dports:
+            new_bridges[domain] = sorted(set(dports))
+    return new_bridges
 
 async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_intname, dict_of_name_and_path, bridges):
     """Проверка L2: распределение узлов по VLAN и транки между коммутаторами.
@@ -1548,7 +1604,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         else:
             errs.append(f'L2: не удалось опросить коммутатор {name}')
 
-    links, sw_links = build_switch_links(switches, dict_of_name_and_intname, bridges)
+    links, sw_links, facing = build_switch_links(switches, dict_of_name_and_intname, bridges)
 
     # Порты свитчей, за которыми сидит каждый не-свитчевый узел
     node_ports = {}
@@ -1652,7 +1708,12 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         'switch_vlans': {sw: {str(vid): sorted(p) for vid, p in d['vlans'].items()} for sw, d in switch_data.items()},
         'switch_trunks': {sw: {p: sorted(v) for p, v in d['trunks'].items()} for sw, d in switch_data.items()},
     }
-    return {'membership': (total - wrong, total), 'trunks': trunks_result, 'errors': errs, 'debug': debug}
+    # groups/switches/facing/switch_data нужны шагу подмены L1 -> L2
+    # (build_l2_domains) после разбора адресов
+    return {'membership': (total - wrong, total), 'trunks': trunks_result,
+            'errors': errs, 'debug': debug,
+            'groups': groups, 'switches': switches,
+            'facing': facing, 'switch_data': switch_data}
 ############################################################ L2 MULTISWITCH END
 
 def int_of_ostype(i, d1, d2):
@@ -1722,7 +1783,7 @@ async def results(request: Request):
 async def read_report(request: Request):
     return await render_dashboard(request)
 
-linux_full_cmd = 'echo SSHD ===START;systemctl status ssh|grep -c "Active: active (running)";echo DNSSERVER ===START;systemctl status named|grep -c "Active: active (running)";echo IPADDR ===START;ip a;echo IPROUTE ===START;ip r;echo HOSTNAME ===START;hostname;echo FORWARDING ===START;sysctl net.ipv4.ip_forward;echo DNSCLI ===START;command -v resolvectl >/dev/null && resolvectl status | awk "/Current DNS Server/ {print \"nameserver \" \$NF}" || cat /etc/resolv.conf;echo NFTSERVICE ===START;systemctl status nftables;echo DHCPDINSTALL ===START;dpkg -l |grep -c isc-dhcp-server;echo DHCPDRUN ===START;systemctl status isc-dhcp-server |grep -c "Active: active (running)"'
+linux_full_cmd = 'echo SSHD ===START;systemctl status ssh|grep -c "Active: active (running)";echo DNSSERVER ===START;systemctl status named|grep -c "Active: active (running)";echo IPADDR ===START;ip -d a;echo IPROUTE ===START;ip r;echo HOSTNAME ===START;hostname;echo FORWARDING ===START;sysctl net.ipv4.ip_forward;echo DNSCLI ===START;command -v resolvectl >/dev/null && resolvectl status | awk "/Current DNS Server/ {print \"nameserver \" \$NF}" || cat /etc/resolv.conf;echo NFTSERVICE ===START;systemctl status nftables;echo DHCPDINSTALL ===START;dpkg -l |grep -c isc-dhcp-server;echo DHCPDRUN ===START;systemctl status isc-dhcp-server |grep -c "Active: active (running)"'
 win_full_cmd = 'chcp 65001 & echo IPADDR ===START & ipconfig & echo IPROUTE ===START & route print -4 & echo HOSTNAME ===START & hostname & echo DNSCLI ===START & netsh interface ipv4 show dns'
 #linux_full_cmd = 'echo DNSSERVER ===START;systemctl status named;echo IPADDR ===START;ip a;echo IPROUTE ===START;ip r;echo HOSTNAME ===START;hostname;echo FORWARDING ===START;sysctl net.ipv4.ip_forward;echo DNSCLI ===START;cat /etc/resolv.conf;echo NFTSERVICE ===START;systemctl status nftables;echo DHCPDINSTALL ===START;dpkg -l |grep -c isc-dhcp-server'
 linux_nftrules_cmd = 'nft list ruleset'
@@ -2080,13 +2141,17 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 # =============== L2 MULTISWITCH (VLAN) END ===============
 
 
-                interface_pattern = r'^\d+: (\w+):'
+                # Заголовок интерфейса из `ip -d a`: имя может содержать точку
+                # (ens3.10), у сабинтерфейса после имени идёт @родитель
+                interface_pattern = r'^\d+: ([^:@\s]+)(?:@(\S+))?:'
                 mac_pattern = r'link/ether (\S+)'
                 state_pattern = r'state (\S+)'
-                ipv4_pattern = r'inet (\d+\.\d+\.\d+\.\d+)'
+                # Строка деталей vlan-сабинтерфейса из `ip -d a` — даёт VLAN ID
+                # независимо от нейминга (ens3.10, vlan10, произвольное имя)
+                vlanid_pattern = r'vlan protocol 802\.1Q id (\d+)'
                 ipv4_pattern = r'inet (\d+\.\d+\.\d+\.\d+)/(\d+)'
-                # ipv4_pattern = r'inet (\d+\.\d+\.\d+\.\d+)(?:/(\d+))?'
 
+                dict_of_subints = {}
 
                 for name in list_of_vmnames:
                     if dict_of_name_and_ostype[name] == 'linux':
@@ -2099,18 +2164,21 @@ async def ping(request: Request, fmt: str = Query('auto')):
                             interface_match = re.search(interface_pattern, line)
                             if interface_match:
                                 current_interface = interface_match.group(1)
-                                linux_ints[current_interface] = {"mac": "", "state": "", "ipv4": []}
-                            
+                                linux_ints[current_interface] = {"mac": "", "state": "", "ipv4": [], "parent": interface_match.group(2), "vlan": None}
+
                             # Если имя интерфейса найдено, ищем другие данные
                             if current_interface:
                                 mac_match = re.search(mac_pattern, line)
                                 state_match = re.search(state_pattern, line)
+                                vlan_match = re.search(vlanid_pattern, line)
                                 ipv4_matches = re.findall(ipv4_pattern, line)
 
                                 if mac_match:
                                     linux_ints[current_interface]["mac"] = mac_match.group(1)
                                 if state_match:
                                     linux_ints[current_interface]["state"] = state_match.group(1)
+                                if vlan_match:
+                                    linux_ints[current_interface]["vlan"] = int(vlan_match.group(1))
                                 if ipv4_matches:
                                     ip_with_mask = []
                                     for ipv4tmp in ipv4_matches:
@@ -2118,13 +2186,15 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                     linux_ints[current_interface]["ipv4"].extend(ip_with_mask)
                         dict_of_name_and_ostype['debug'] = linux_ints
 
-                        # Обратная карта: MAC -> имя интерфейса гостя (из вывода `ip a`).
+                        # Обратная карта: MAC -> имя интерфейса гостя (из вывода `ip -d a`).
                         # Заменяет угадывание имён (ens3+idx / ens3f{idx} / eth0 для Scan) —
                         # имя интерфейса ищем по MAC из командной строки qemu.
+                        # Только физические интерфейсы: vlan-сабинтерфейсы наследуют
+                        # MAC родителя и затирали бы его в карте.
                         mac_to_guestif = {
                             data['mac'].lower(): ifname
                             for ifname, data in linux_ints.items()
-                            if data['mac']
+                            if data['mac'] and not data['parent']
                         }
 
                         for intname in dict_of_name_and_intname[name]:
@@ -2148,6 +2218,40 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                 dict_of_intnames_ipaddr[intname] = "MULTI"
                             else:
                                 dict_of_intnames_ipaddr[intname] = ips[0]
+
+                        # === L2 MULTISWITCH: vlan-сабинтерфейсы (только при активной
+                        # подсказке). Каждый сабинтерфейс регистрируется как виртуальный
+                        # инт 'tap.vlanid' со своим адресом — дальше базовые проверки
+                        # (адреса, сети, шлюзы, дубли) работают с ним как с обычным.
+                        if l2res:
+                            for intname in list(dict_of_name_and_intname[name]):
+                                tap_mac = dict_of_intname_and_mac.get(intname, '').lower()
+                                guest_if = mac_to_guestif.get(tap_mac)
+                                if not guest_if:
+                                    continue
+                                has_subints = False
+                                for ifname, data in linux_ints.items():
+                                    if data['parent'] == guest_if and data['vlan']:
+                                        has_subints = True
+                                        virt = f'{intname}.{data["vlan"]}'
+                                        dict_of_name_and_intname[name].append(virt)
+                                        dict_of_subints.setdefault(intname, {})[data['vlan']] = virt
+                                        ips = data['ipv4']
+                                        if ips:
+                                            dict_of_intnames_realaddr[virt] = ips[0]
+                                        if data['state'] == 'DOWN':
+                                            dict_of_intnames_ipaddr[virt] = 'DOWN'
+                                        elif len(ips) == 0:
+                                            dict_of_intnames_ipaddr[virt] = 'NONE'
+                                        elif len(ips) > 1:
+                                            dict_of_intnames_ipaddr[virt] = 'MULTI'
+                                        else:
+                                            dict_of_intnames_ipaddr[virt] = ips[0]
+                                if has_subints and dict_of_intnames_ipaddr.get(intname) == 'NONE':
+                                    # Физический родитель без адреса — норма для
+                                    # роутера-на-палочке, не штрафуем его как безадресный
+                                    dict_of_name_and_intname[name].remove(intname)
+                                    dict_of_intnames_ipaddr.pop(intname, None)
 
 
 
@@ -2183,8 +2287,21 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         if ip_trigger == '0':
                             dict_of_intnames_ipaddr[dict_of_name_and_intname[name][0]] = 'NONE'
                         if gw_trigger == '0':
-                            dict_of_vmnames_defgw[name] = 'NONE'    
+                            dict_of_vmnames_defgw[name] = 'NONE'
 
+                # =============== L2 MULTISWITCH: ПОДМЕНА L1 -> L2 ===============
+                # Все проверки ниже (Networks, шлюзы, дубли, домены) работают по
+                # bridges. При активной L2-подсказке заменяем физическую картину
+                # (точечные линки "узел-порт свитча") VLAN-доменами задуманной
+                # топологии — дальше базовая логика идёт без изменений.
+                if l2res:
+                    try:
+                        bridges = build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints)
+                        answer['l2_domains'] = str(bridges)
+                        answer['l2_subints'] = str(dict_of_subints)
+                    except Exception:
+                        log('build_l2_domains err', traceback.format_exc())
+                # =============== L2 MULTISWITCH: ПОДМЕНА L1 -> L2 END ===============
 
                 for name in list_of_vmnames:
                     if dict_of_name_and_ostype[name] == 'linux':

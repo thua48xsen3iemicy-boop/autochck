@@ -93,20 +93,22 @@
 </style>
 </head>
 <body>
+{# Словарь переводов названий проверок; пустой, если бэкенд не прислал #}
+{% set labels = labels if labels is defined else {} %}
 {# Детальная разбивка одной попытки: баллы по проверкам, штрафы, замечания #}
-{% macro detail(a) %}
+{% macro detail(a, labels) %}
     <table class="checks">
       <thead><tr><th>Проверка</th><th>Баллы</th></tr></thead>
       <tbody>
       {% for it in a['items'] %}
         <tr class="{% if it.max == 0 %}row-zero{% elif it.score == it.max %}row-ok{% else %}row-bad{% endif %}">
-          <td>{{ it.name }}</td>
+          <td>{{ labels.get(it.name, it.name) }}</td>
           <td>{{ it.score }} / {{ it.max }}</td>
         </tr>
       {% endfor %}
       {% for pname, p in a['penalties'].items() %}
         <tr class="row-penalty">
-          <td>{{ pname }} (штраф)</td>
+          <td>{{ labels.get(pname, pname) }} (штраф)</td>
           <td>−{{ p.points }}</td>
         </tr>
       {% endfor %}
@@ -172,7 +174,7 @@
       </div>
     </div>
 
-    {{ detail(latest) }}
+    {{ detail(latest, labels) }}
 
     {% if lab.attempts|length > 1 %}
     <details class="history">
@@ -186,7 +188,7 @@
           {% if a.grade is not none %}<span class="badge grade grade-{{ a.grade }}">Оценка: {{ a.grade }}</span>{% endif %}
           {% if a.lab_done %}<span class="badge done ok">Сдано</span>{% else %}<span class="badge done">Не сдано</span>{% endif %}
         </summary>
-        {{ detail(a) }}
+        {{ detail(a, labels) }}
       </details>
       {% endfor %}
     </details>

@@ -63,6 +63,15 @@
   .done-dot { color: var(--ok); font-size: 11px; }
   td.total { font-weight: 700; font-variant-numeric: tabular-nums; }
 
+  /* прицел: подсветка строки/столбца по наведению и закрепление кликом */
+  th.colhead, td.rowhead { cursor: pointer; user-select: none; }
+  th.colhead:hover, td.rowhead:hover { color: var(--accent); }
+  .tablewrap td.col-hover, .tablewrap th.col-hover { background: #eef4ff; }
+  .tablewrap tr.row-pinned td { background: #eaf1ff; }
+  .tablewrap td.col-pinned, .tablewrap th.col-pinned { background: #e2ecff; }
+  .tablewrap tr.row-pinned td.col-pinned { background: #d3e2ff; }
+  .tablewrap th.col-pinned, .tablewrap tr.row-pinned td.stud { box-shadow: inset 0 -2px 0 var(--accent); }
+
   /* кликабельная ячейка с оценкой */
   button.cellbtn { font: inherit; border: none; background: none; cursor: pointer; padding: 0; }
   button.cellbtn:hover .g { box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--accent); }
@@ -232,18 +241,20 @@
         <thead>
           <tr>
             <th class="stud">Студент</th>
-            {% for lab in selected_labs %}<th>{{ lab }}</th>{% endfor %}
+            {% for lab in selected_labs %}
+              <th class="colhead" data-col="{{ loop.index }}" title="Клик — закрепить столбец">{{ lab }}</th>
+            {% endfor %}
             <th>Итого</th>
           </tr>
         </thead>
         <tbody>
           {% for r in rows %}
           <tr>
-            <td class="stud">{{ r.name }}</td>
+            <td class="stud rowhead" title="Клик — закрепить строку">{{ r.name }}</td>
             {% for lab in selected_labs %}
               {% set c = r.cells[lab] %}
               {% set cid = 'c-' ~ loop.index0 ~ '-' ~ r.username %}
-              <td>
+              <td data-col="{{ loop.index }}">
                 {% if c %}
                   <button type="button" class="cellbtn" data-modal="{{ cid }}" title="Подробности">
                     <span class="cell">
@@ -302,6 +313,30 @@
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape') closeModal();
   });
+
+  // Прицел по таблице: подсветка столбца при наведении + закрепление строк/столбцов.
+  var table = document.querySelector('.tablewrap table');
+  if (table) {
+    function colCells(col) { return table.querySelectorAll('[data-col="' + col + '"]'); }
+    function clearColHover() {
+      table.querySelectorAll('.col-hover').forEach(function (c) { c.classList.remove('col-hover'); });
+    }
+    table.addEventListener('mouseover', function (e) {
+      var cell = e.target.closest('[data-col]');
+      clearColHover();
+      if (cell) colCells(cell.getAttribute('data-col')).forEach(function (c) { c.classList.add('col-hover'); });
+    });
+    table.addEventListener('mouseleave', clearColHover);
+    table.addEventListener('click', function (e) {
+      var head = e.target.closest('th.colhead');
+      if (head) {
+        colCells(head.getAttribute('data-col')).forEach(function (c) { c.classList.toggle('col-pinned'); });
+        return;
+      }
+      var rh = e.target.closest('td.rowhead');
+      if (rh) { rh.parentElement.classList.toggle('row-pinned'); }
+    });
+  }
 </script>
 </body>
 </html>

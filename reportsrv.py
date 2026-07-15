@@ -299,6 +299,17 @@ async def get_student_labs(student: str) -> dict:
     return await loop.run_in_executor(None, _load_student_labs, db_path)
 
 
+def _attempt_view(a: dict, best_id) -> dict:
+    """Плоское представление попытки для шаблонов (report и модалка summary)."""
+    return {
+        'ts': a['ts'], 'clientip': a.get('clientip'), 'score': a['score'],
+        'maxscore': a['max_score'], 'percent': a['percent'], 'grade': a['grade'],
+        'done': bool(a['lab_done']), 'items': a['items'],
+        'penalties': a['penalties'], 'errors': a['errors'],
+        'is_best': a['id'] == best_id,
+    }
+
+
 # ================================================================== Moodle (имена)
 async def fetch_global_groups(url, token, groupname):
     params = {'wstoken': token, 'wsfunction': 'core_cohort_get_cohorts',
@@ -405,10 +416,12 @@ async def summaryinfo(request: Request,
             info = data.get(lab)
             if info:
                 b = info['best']
+                attempts = [_attempt_view(a, b['id']) for a in info['attempts']]
                 cells[lab] = {
                     'grade': b['grade'], 'score': b['score'], 'max': b['max_score'],
                     'percent': b['percent'], 'count': info['count'],
                     'done': bool(b['lab_done']), 'ts': b['ts'],
+                    'attempts': attempts, 'latest': attempts[0] if attempts else None,
                 }
                 total += b['score'] or 0
             else:
@@ -450,13 +463,7 @@ async def read_report(request: Request,
                          'lab_path': f'/GROUPS/{group}/{lab}', 'history': [], 'trycount': 0})
             continue
         b = labinfo['best']
-        attempts = [{
-            'ts': a['ts'], 'clientip': a.get('clientip'), 'score': a['score'],
-            'maxscore': a['max_score'], 'percent': a['percent'], 'grade': a['grade'],
-            'done': bool(a['lab_done']), 'items': a['items'],
-            'penalties': a['penalties'], 'errors': a['errors'],
-            'is_best': a['id'] == b['id'],
-        } for a in labinfo['attempts']]
+        attempts = [_attempt_view(a, b['id']) for a in labinfo['attempts']]
         rows.append({
             'username': name, 'info': info_addr, 'status': b['grade'],
             'lab_path': b['lab_path'], 'score': b['score'], 'maxscore': b['max_score'],

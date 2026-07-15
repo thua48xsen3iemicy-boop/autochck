@@ -1078,23 +1078,54 @@ def read_json_file(file_path):
     return data
 
 
+def node_ciscoenable(handler):
+    ''' Поднимаемся из user exec (>) в privileged exec (#), вводя enable-пароль при необходимости '''
+    handler.sendline('enable')
+    try:
+        j = handler.expect(['Password:', '#'], timeout = cisexpctimeout)
+    except:
+        print('ERROR: error waiting for ["Password:", "#"] prompt.')
+        node_ciscoquit(handler)
+        return False
+    if j == 0:
+        handler.sendline(cissecret)
+        try:
+            handler.expect('#', timeout = cisexpctimeout)
+        except:
+            print('ERROR: error waiting for "#" prompt after enable password.')
+            node_ciscoquit(handler)
+            return False
+    return True
+
 def node_ciscologin(handler):
-    # Send an empty line, and wait for the login prompt
+    # Send an empty line, and wait for the login prompt.
+    # Общий дедлайн cistimeout: мёртвая консоль (EOF, молчание, незнакомый prompt)
+    # иначе крутила бы этот цикл вечно в executor-потоке вместе с /tmp/chk.lock.
+    deadline = time.time() + cistimeout
     i = -1
     while i == -1:
+        if time.time() > deadline:
+            print('ERROR: login deadline exceeded.')
+            node_ciscoquit(handler)
+            return False
         try:
             handler.sendline('\r\n')
             i = handler.expect([
                 'Username:',
+                'Password:',
                 '\(config',
                 '>',
                 '#',
                 'Would you like to enter the'], timeout = 5)
-        except:
+        except pexpect.exceptions.TIMEOUT:
             i = -1
+        except (pexpect.exceptions.EOF, OSError):
+            print('ERROR: console connection closed.')
+            node_ciscoquit(handler)
+            return False
 
     if i == 0:
-        # Need to send username and password
+        # Need to send username and password (login local / aaa)
         handler.sendline(cisusername)
         try:
             handler.expect('Password:', timeout = cisexpctimeout)
@@ -1112,23 +1143,21 @@ def node_ciscologin(handler):
             return False
 
         if j == 0:
-            # Secret password required
-            handler.sendline(cissecret)
-            try:
-                handler.expect('#', timeout = cisexpctimeout)
-            except:
-                print('ERROR: error waiting for "#" prompt.')
-                node_ciscoquit(handler)
-                return False
-            return True
-        elif j == 1:
-            # Nothing to do
-            return True
-        else:
-            # Unexpected output
+            return node_ciscoenable(handler)
+        return True
+    elif i == 1:
+        # Пароль на линии (line con 0 + password/login) — приглашение без Username
+        handler.sendline(cispassword)
+        try:
+            j = handler.expect(['>', '#'], timeout = cisexpctimeout)
+        except:
+            print('ERROR: error waiting for [">", "#"] prompt after line password.')
             node_ciscoquit(handler)
             return False
-    elif i == 1:
+        if j == 0:
+            return node_ciscoenable(handler)
+        return True
+    elif i == 2:
         # Config mode detected, need to exit
         handler.sendline('end')
         try:
@@ -1138,36 +1167,13 @@ def node_ciscologin(handler):
             node_ciscoquit(handler)
             return False
         return True
-    elif i == 2:
-        # Need higher privilege
-        handler.sendline('enable')
-        try:
-            j = handler.expect(['Password:', '#'])
-        except:
-            print('ERROR: error waiting for ["Password:", "#"] prompt.')
-            node_ciscoquit(handler)
-            return False
-        if j == 0:
-            # Need do provide secret
-            handler.sendline(secret)
-            try:
-                handler.expect('#', timeout = cisexpctimeout)
-            except:
-                print('ERROR: error waiting for "#" prompt.')
-                node_ciscoquit(handler)
-                return False
-            return True
-        elif j == 1:
-            # Nothing to do
-            return True
-        else:
-            # Unexpected output
-            node_ciscoquit(handler)
-            return False
     elif i == 3:
+        # Need higher privilege
+        return node_ciscoenable(handler)
+    elif i == 4:
         # Nothing to do
         return True
-    elif i == 4:
+    elif i == 5:
         # First boot detected
         handler.sendline('no')
         try:
@@ -1201,9 +1207,20 @@ def node_ciscologin(handler):
 
 
 def node_ciscoquit(handler):
-    if handler.isalive() == True:
-        handler.sendline('quit\n')
-    handler.close()
+    # Разлогиниваем консоль и закрываем telnet. Вызывается и на успехе, и на
+    # ошибках (может быть вызван дважды) — поэтому все шаги защищены.
+    try:
+        if handler.isalive():
+            # 'exit' завершает exec-сессию на консоли, чтобы после проверки
+            # не оставалась открытая привилегированная сессия без пароля
+            handler.sendline('exit')
+            time.sleep(0.3)
+    except Exception:
+        pass
+    try:
+        handler.close(force=True)
+    except Exception:
+        pass
 
 
 
@@ -1223,10 +1240,11 @@ def config_ciscoget(handler):
         handler.expect('#', timeout = cisexpctimeout)
     except:
         print('ERROR: error waiting for "#" prompt.')
-        node_quit(handler)
+        node_ciscoquit(handler)
         return False
 
-    handler.sendline('echo SHELL ===START===')
+    # term shell включает shell processing и должен идти ДО первого echo,
+    # иначе echo — неизвестная команда и маркер секции не печатается
     handler.sendline('term shell')
     handler.sendline('terminal width 500')
     handler.sendline('echo VLAN ===START===')
@@ -1280,9 +1298,11 @@ def run_on_viosl2(handler):
         node_ciscoquit(handler)
         return ['err', 'login']
     config = config_ciscoget(handler)
+    # Закрываем сессию и на успешном пути: раньше telnet оставался висеть,
+    # а консоль — в privileged mode
+    node_ciscoquit(handler)
     if config in [False, None]:
         print('ERROR: failed to retrieve config.')
-        node_ciscoquit(handler)
         return ['err', 'output']
 
     return config
@@ -1684,7 +1704,14 @@ async def ping(request: Request, fmt: str = Query('auto')):
 
 
                 for cisco_result in cisco_results:
-                    dict_of_name_cisco_script[cisco_result[0]] = cisco_result[1]
+                    # run_on_viosl2 при неудаче возвращает ['err', 'login'|'output'] —
+                    # раньше это молча оседало в отладочном словаре
+                    if isinstance(cisco_result[1], list) and cisco_result[1][:1] == ['err']:
+                        reason = 'не удалось войти (проверьте пароли)' if cisco_result[1][1] == 'login' else 'не удалось прочитать вывод'
+                        errors['errors_noty'].append(f'Проблемы на {cisco_result[0]}: {reason}')
+                        dict_of_name_cisco_script[cisco_result[0]] = {}
+                    else:
+                        dict_of_name_cisco_script[cisco_result[0]] = cisco_result[1]
 
                 answer['dict_of_name_cisco_script'] = dict_of_name_cisco_script
 

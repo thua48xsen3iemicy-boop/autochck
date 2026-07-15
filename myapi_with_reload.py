@@ -1381,6 +1381,280 @@ async def execute_command_routeros(cmd, port, name):
     return name, result
 ############################################################ ROUTEROS
 
+############################################################ L2 MULTISWITCH
+# Проверка распределения узлов по VLAN на управляемых коммутаторах (viosl2),
+# в том числе при нескольких свитчах с транками между ними. Самостоятельный
+# блок: свитчи опрашиваются повторно, независимо от основного прохода.
+#
+# Подсказка задаётся преподавателем в <description> лабы (.unl) — группы
+# вхождения в VLAN в скобках, опционально с номером VLAN через двоеточие:
+#   (A, B, R) (C,D,R) (E,R)      — проверяется только разбиение
+#   (10: A,B,R) (20: C,D,R)      — дополнительно проверяются сами номера
+# Узел, входящий в несколько групп (роутер), может сидеть на trunk-порту.
+# STP/VTP/native vlan сознательно не проверяются: топологии без избыточных
+# связей.
+
+def parse_l2_hint(lab_file):
+    """Читает L2-подсказку из <description> файла лабы.
+
+    Возвращает список групп [{'vlan': int|None, 'members': [имена]}].
+    Пустой список — подсказки нет, L2-проверка не выполняется.
+    """
+    try:
+        with open(lab_file, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError as e:
+        log('parse_l2_hint read err', e)
+        return []
+    m = re.search(r'<description>(.*?)</description>', content, re.DOTALL)
+    if not m:
+        return []
+    groups = []
+    for grp in re.findall(r'\(([^)]*)\)', m.group(1)):
+        vlan = None
+        body = grp
+        vm = re.match(r'\s*(\d+)\s*:\s*(.*)$', grp, re.DOTALL)
+        if vm:
+            vlan = int(vm.group(1))
+            body = vm.group(2)
+        members = [x.strip() for x in body.split(',') if x.strip()]
+        if members:
+            groups.append({'vlan': vlan, 'members': members})
+    return groups
+
+def parse_vlan_list(text):
+    """'1,10,20-22' -> {1, 10, 20, 21, 22}; 'none' -> пустое множество."""
+    vlans = set()
+    for part in text.split(','):
+        part = part.strip()
+        if '-' in part:
+            a, _, b = part.partition('-')
+            if a.strip().isdigit() and b.strip().isdigit():
+                vlans.update(range(int(a), int(b) + 1))
+        elif part.isdigit():
+            vlans.add(int(part))
+    return vlans
+
+def parse_vlan_brief(lines):
+    """Секция VLAN (show vlan brief) -> {vlan_id: множество access-портов}.
+
+    Наличие vlan в словаре означает, что он создан и активен; trunk-порты
+    в этом выводе не перечисляются.
+    """
+    vlans = {}
+    for line in lines:
+        m = re.match(r'^(\d+)\s+\S+\s+active\s*(.*)$', line.strip())
+        if m:
+            ports = {p.strip() for p in m.group(2).split(',') if p.strip()}
+            vlans[int(m.group(1))] = ports
+    return vlans
+
+def parse_int_trunk(lines):
+    """Секция TRUNK (show int trunk) -> {порт: множество vlan (allowed and active)}.
+
+    Берём блок "Vlans allowed and active": он требует, чтобы vlan был и
+    разрешён на транке, и создан на этом свитче. Заголовок первого блока
+    (со словами 'Native vlan') отфильтрован ещё при съёме конфига.
+    """
+    trunks = {}
+    section = 'status'
+    for line in lines:
+        s = line.strip()
+        if s.startswith('Port '):
+            if 'allowed and active' in s:
+                section = 'active'
+            else:
+                section = 'other'
+            continue
+        parts = s.split()
+        if not parts:
+            continue
+        if section == 'status' and 'trunking' in parts:
+            trunks.setdefault(parts[0], set())
+        elif section == 'active' and len(parts) >= 2 and parts[0] in trunks:
+            trunks[parts[0]] = parse_vlan_list(parts[1])
+    return trunks
+
+def build_switch_links(switch_names, dict_of_name_and_intname, bridges):
+    """Схема подключений по линукс-бриджам (tap vunlX_N <-> сосед по бриджу).
+
+    Возвращает:
+      links:    {свитч: {'GiA/B': [имена соседей по бриджу]}}
+      sw_links: [(свитч1, порт1, свитч2, порт2)] — линки между свитчами
+    Номер интерфейса N из имени tap переводится в имя порта vIOS-L2
+    (4 порта на модуль): N=5 -> Gi1/1.
+    """
+    tap_owner = {}
+    for vmname, taps in dict_of_name_and_intname.items():
+        for tap in taps:
+            tap_owner[tap] = vmname
+
+    def portname(tap):
+        n = int(tap.split('_')[1])
+        return f'Gi{n // 4}/{n % 4}'
+
+    links = {sw: {} for sw in switch_names}
+    sw_links = []
+    for ports in bridges.values():
+        vunl = [p for p in ports if p.startswith('vunl') and p in tap_owner]
+        sw_taps = [t for t in vunl if tap_owner[t] in switch_names]
+        for tap in sw_taps:
+            owner = tap_owner[tap]
+            peers = [tap_owner[t] for t in vunl if t != tap]
+            links[owner][portname(tap)] = peers
+        for a in range(len(sw_taps)):
+            for b in range(a + 1, len(sw_taps)):
+                t1, t2 = sw_taps[a], sw_taps[b]
+                sw_links.append((tap_owner[t1], portname(t1), tap_owner[t2], portname(t2)))
+    return links, sw_links
+
+async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_intname, dict_of_name_and_path, bridges):
+    """Проверка L2: распределение узлов по VLAN и транки между коммутаторами.
+
+    Возвращает None, если в лабе нет подсказки или нет свитчей, иначе dict:
+      {'membership': (score, max), 'trunks': (score, max) или None,
+       'errors': [сообщения для отчёта], 'debug': {...}}
+    """
+    groups = parse_l2_hint(lab_file)
+    switches = [n for n, t in dict_of_name_and_ostype.items() if t == 'viosl2']
+    if not groups or not switches:
+        return None
+
+    errs = []
+    known = set(dict_of_name_and_ostype)
+
+    # Скобки из обычного текста описания (ни одного известного имени) — не подсказка
+    groups = [g for g in groups if any(m in known for m in g['members'])]
+    if not groups:
+        return None
+
+    # Повторный опрос свитчей, независимый от основного прохода
+    tasks = []
+    for name in switches:
+        path = dict_of_name_and_path.get(name)
+        if not path:
+            errs.append(f'L2: у коммутатора {name} не найден путь к консоли')
+            continue
+        port = int(path.split('/')[1]) + 30000
+        handler = pexpect.spawnu(f'telnet 127.0.0.1 {port}', maxread=100000)
+        tasks.append(asyncio.ensure_future(execute_command_cisco(handler, name)))
+    switch_data = {}
+    for name, sections in await asyncio.gather(*tasks):
+        if isinstance(sections, dict) and sections.get('VLAN'):
+            switch_data[name] = {
+                'vlans': parse_vlan_brief(sections['VLAN']),
+                'trunks': parse_int_trunk(sections.get('TRUNK', [])),
+            }
+        else:
+            errs.append(f'L2: не удалось опросить коммутатор {name}')
+
+    links, sw_links = build_switch_links(switches, dict_of_name_and_intname, bridges)
+
+    # Порты свитчей, за которыми сидит каждый не-свитчевый узел
+    node_ports = {}
+    for sw, ports in links.items():
+        for pname, peers in ports.items():
+            for peer in peers:
+                if peer not in switches:
+                    node_ports.setdefault(peer, []).append((sw, pname))
+
+    # VLAN каждой группы: из подсказки, иначе выводим из фактических
+    # access-портов участников (самый частый; vlan 1 не считаем — это
+    # "ничего не настроено"; один и тот же vlan двум группам не отдаём)
+    used_vlans = set(g['vlan'] for g in groups if g['vlan'])
+    for g in groups:
+        if g['vlan'] is not None:
+            continue
+        cnt = Counter()
+        for member in g['members']:
+            for sw, pname in node_ports.get(member, []):
+                for vid, aports in switch_data.get(sw, {}).get('vlans', {}).items():
+                    if pname in aports and vid != 1:
+                        cnt[vid] += 1
+        for vid, _ in cnt.most_common():
+            if vid not in used_vlans:
+                g['vlan'] = vid
+                used_vlans.add(vid)
+                break
+        if g['vlan'] is None:
+            errs.append(f'L2: не удалось определить VLAN группы ({", ".join(g["members"])}) — участники не расставлены по access-портам')
+
+    # Узлы из нескольких групп (роутер) могут сидеть и на trunk-порту
+    member_count = Counter(m for g in groups for m in g['members'])
+
+    def node_in_vlan(member, vid):
+        for sw, pname in node_ports.get(member, []):
+            data = switch_data.get(sw)
+            if not data:
+                continue
+            if pname in data['vlans'].get(vid, set()):
+                return True  # access-порт в нужном vlan
+            if member_count[member] > 1 and vid in data['trunks'].get(pname, set()):
+                return True  # trunk с этим vlan — роутер-на-палочке
+        return False
+
+    # Балл за каждое вхождение "узел в группе"
+    total = 0
+    wrong = 0
+    for g in groups:
+        vid = g['vlan']
+        for member in g['members']:
+            total += 1
+            if member not in known:
+                wrong += 1
+                errs.append(f'L2: узел {member} из подсказки не найден в лабе')
+            elif vid is None or not node_in_vlan(member, vid):
+                wrong += 1
+                errs.append(f'L2: {member} не в VLAN {vid if vid else "?"}')
+
+    # Связность каждой группы через транки между свитчами: BFS по линкам,
+    # где vlan группы разрешён и активен с обеих сторон
+    trunks_result = None
+    if len(switches) > 1:
+        t_total = 0
+        t_wrong = 0
+        for g in groups:
+            vid = g['vlan']
+            hosts = set()
+            for member in g['members']:
+                for sw, _pname in node_ports.get(member, []):
+                    hosts.add(sw)
+            if len(hosts) < 2:
+                continue  # группа целиком на одном свитче — транки не нужны
+            t_total += 1
+            if vid is None:
+                t_wrong += 1
+                continue
+            reached = {next(iter(hosts))}
+            changed = True
+            while changed:
+                changed = False
+                for sw1, p1, sw2, p2 in sw_links:
+                    ok1 = vid in switch_data.get(sw1, {}).get('trunks', {}).get(p1, set())
+                    ok2 = vid in switch_data.get(sw2, {}).get('trunks', {}).get(p2, set())
+                    if ok1 and ok2:
+                        if sw1 in reached and sw2 not in reached:
+                            reached.add(sw2)
+                            changed = True
+                        elif sw2 in reached and sw1 not in reached:
+                            reached.add(sw1)
+                            changed = True
+            if not hosts <= reached:
+                t_wrong += 1
+                errs.append(f'L2: VLAN {vid} не проходит до коммутаторов {", ".join(sorted(hosts - reached))} — проверьте транки')
+        if t_total:
+            trunks_result = (t_total - t_wrong, t_total)
+
+    debug = {
+        'groups': [{'vlan': g['vlan'], 'members': g['members']} for g in groups],
+        'links': links,
+        'sw_links': sw_links,
+        'switch_vlans': {sw: {str(vid): sorted(p) for vid, p in d['vlans'].items()} for sw, d in switch_data.items()},
+        'switch_trunks': {sw: {p: sorted(v) for p, v in d['trunks'].items()} for sw, d in switch_data.items()},
+    }
+    return {'membership': (total - wrong, total), 'trunks': trunks_result, 'errors': errs, 'debug': debug}
+############################################################ L2 MULTISWITCH END
+
 def int_of_ostype(i, d1, d2):
     for key, val in d1.items():
         if isinstance(val, list):
@@ -1783,8 +2057,27 @@ async def ping(request: Request, fmt: str = Query('auto')):
 
                 answer['dict_of_name_cisco_script'] = dict_of_name_cisco_script
 
-                answer['dict_of_vmnames_hostname'] = dict_of_vmnames_hostname        
+                answer['dict_of_vmnames_hostname'] = dict_of_vmnames_hostname
                 answer['dict_of_name_routeros_script'] = dict_of_name_routeros_script
+
+                # =============== L2 MULTISWITCH (VLAN) ===============
+                # Отдельный проход: коммутаторы опрашиваются повторно, подсказка
+                # берётся из <description> лабы. Ошибка внутри блока не роняет
+                # остальную проверку.
+                try:
+                    l2res = await check_l2_vlans(lab_path, dict_of_name_and_ostype,
+                                                 dict_of_name_and_intname,
+                                                 dict_of_name_and_path, bridges)
+                except Exception:
+                    l2res = None
+                    log('check_l2_vlans err', traceback.format_exc())
+                if l2res:
+                    answer['l2_vlans_debug'] = l2res['debug']
+                    errors['errors_noty'].extend(l2res['errors'])
+                    add_check('vlan_membership', l2res['membership'][0], l2res['membership'][1])
+                    if l2res['trunks']:
+                        add_check('vlan_trunks', l2res['trunks'][0], l2res['trunks'][1])
+                # =============== L2 MULTISWITCH (VLAN) END ===============
 
 
                 interface_pattern = r'^\d+: (\w+):'

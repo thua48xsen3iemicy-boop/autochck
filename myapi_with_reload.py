@@ -965,6 +965,10 @@ IP = "127.0.0.1"
 #port = 30491
 USER_NAME = "admin"
 USER_PASS = "123"
+# Пары логин/пароль, которые пробуем по очереди: основная и admin без пароля
+# (заводской RouterOS). После неудачной попытки консоль снова показывает
+# Login:, так что следующую пару можно вводить сразу.
+MTK_CREDENTIALS = [(USER_NAME, USER_PASS), (USER_NAME, '')]
 MTK_PROMPT = "] >"  # Пример приглашения командной строки MikroTik
 # Приглашение в любом подменю ("[admin@MikroTik] /ip address>"): если студент
 # оставил сессию не в корне меню, "] >" в потоке не встретится
@@ -1031,39 +1035,54 @@ def node_login(handler, depth=0):
             return False
 
     if i == 0:
-        # Необходимо ввести имя пользователя и пароль
-        handler.send(USER_NAME + '+c512wt')
-        handler.send('\r\n')
-        try:
-            handler.expect('Password:', timeout=EXPTIMEOUT)
-        except pexpect.exceptions.TIMEOUT:
-            print('ERROR: error waiting for "Password:" prompt.')
-            #node_quit(handler)
-            return False
-        handler.sendline(USER_PASS)
-        handler.send('\r\n')
-        try:
-            j = handler.expect(['Login:', MTK_PROMPT, r'\[Y/n\]'], timeout=CONTIMEOUT)
-        except (pexpect.exceptions.TIMEOUT, pexpect.exceptions.EOF):
-            # Раньше TIMEOUT здесь не ловился и исключение роняло всю проверку
-            print('ERROR: error waiting for prompt after password.')
-            return False
-        if j == 0:
-            # Снова Login: — пароль не подошёл
-            return False
-        if j == 2:
-            # Вопрос про просмотр лицензии при первом входе на свежем RouterOS
-            handler.sendline('n')
-            try:
-                handler.expect(MTK_PROMPT, timeout=CONTIMEOUT)
-            except (pexpect.exceptions.TIMEOUT, pexpect.exceptions.EOF):
-                print('ERROR: error waiting for prompt after license question.')
+        # Пробуем пары логин/пароль по очереди
+        for user, password in MTK_CREDENTIALS:
+            rc = node_trylogin(handler, user, password)
+            if rc == 'ok':
+                return True
+            if rc == 'err':
                 return False
-        return True
+            # rc == 'badpass': консоль снова на Login: — пробуем следующую пару
+        print('ERROR: all credentials rejected.')
+        return False
     else:
         # Открыта чужая сессия (возможно, в подменю) — /quit и повторяем вход
         node_quit(handler)
         return node_login(handler, depth + 1)
+
+def node_trylogin(handler, user, password):
+    ''' Одна попытка входа с приглашения Login:.
+
+    Возвращает 'ok' (вошли), 'badpass' (снова Login: — пара не подошла,
+    можно пробовать следующую) или 'err' (консоль повела себя неожиданно).
+    '''
+    handler.send(user + '+c512wt')
+    handler.send('\r\n')
+    try:
+        handler.expect('Password:', timeout=EXPTIMEOUT)
+    except pexpect.exceptions.TIMEOUT:
+        print('ERROR: error waiting for "Password:" prompt.')
+        return 'err'
+    handler.sendline(password)
+    handler.send('\r\n')
+    try:
+        j = handler.expect(['Login:', MTK_PROMPT, r'\[Y/n\]'], timeout=CONTIMEOUT)
+    except (pexpect.exceptions.TIMEOUT, pexpect.exceptions.EOF):
+        # Раньше TIMEOUT здесь не ловился и исключение роняло всю проверку
+        print('ERROR: error waiting for prompt after password.')
+        return 'err'
+    if j == 0:
+        # Снова Login: — пароль не подошёл
+        return 'badpass'
+    if j == 2:
+        # Вопрос про просмотр лицензии при первом входе на свежем RouterOS
+        handler.sendline('n')
+        try:
+            handler.expect(MTK_PROMPT, timeout=CONTIMEOUT)
+        except (pexpect.exceptions.TIMEOUT, pexpect.exceptions.EOF):
+            print('ERROR: error waiting for prompt after license question.')
+            return 'err'
+    return 'ok'
 
 def config_get(handler, cmd):
     ''' Отправляем скрипт опроса и читаем вывод до маркера завершения '''
@@ -1748,7 +1767,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         dict_of_vmnames_hostname[routeros_result[0]] = 'NONE'
                         for intname in dict_of_name_and_intname[routeros_result[0]]:
                             dict_of_intnames_ipaddr[intname] = "NONE"
-                        errors['errors_noty'].append(f'Проблемы на {routeros_result[0]}: не удалось войти (пароль admin/123?) или прочитать вывод')
+                        errors['errors_noty'].append(f'Проблемы на {routeros_result[0]}: не удалось войти (пробовали admin/123 и admin без пароля) или прочитать вывод')
 
 
 

@@ -821,6 +821,22 @@ def start_bridge():
     return(dict_of_name_and_path, list_of_vmnames, list_of_intname, dict_of_name_and_intname, cleaned_bridges)
 
 
+def qga_recv_json(sock):
+    """Читает из сокета qemu-guest-agent один полный JSON-ответ.
+
+    Ответы QGA разделяются переводом строки. Одиночный recv не гарантирует
+    целого ответа: большой вывод (ip -d a, крупные конфиги) приходит
+    несколькими сегментами, и json.loads от куска ронял всю проверку.
+    """
+    buf = b''
+    while b'\n' not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise socket.timeout('qga socket closed')
+        buf += chunk
+    line = buf.split(b'\n', 1)[0].strip()
+    return json.loads(line.decode('utf-8'))
+
 def execute_command_sync(command, os_type, socket_path):
 
     # Путь к сокету QEMU Monitor
@@ -859,10 +875,7 @@ def execute_command_sync(command, os_type, socket_path):
         sock.sendall(json.dumps(exec_command).encode("utf-8"))
         time.sleep(0.1)
         # Получение ответа с идентификатором процесса
-        data = sock.recv(4096)
-        # data = read_full_response(sock)
-        #log(str(data), socket_path)
-        response = json.loads(data.decode("utf-8"))
+        response = qga_recv_json(sock)
         process_id = response.get("return", {}).get("pid")
 
         # Если есть идентификатор процесса, запросить статус
@@ -884,13 +897,12 @@ def execute_command_sync(command, os_type, socket_path):
                 sock.sendall(json.dumps(status_command).encode("utf-8"))
                 time.sleep(0.1)
                 # Получение ответа с результатом выполнения команды
-                data = sock.recv(32768)
-                log(f'_{socket_path} {command}', data)
-                response = json.loads(data.decode("utf-8"))
-                #response = json.loads(data)
-                # log(f'path: {socket_path}', f'socket data: {response}')
+                response = qga_recv_json(sock)
+                log(f'_{socket_path} {command}', str(response)[:1500])
                 # Если команда завершилась, вывести результат
                 if response.get("return", {}).get("exited", False):
+                    if response.get("return", {}).get("out-truncated"):
+                        log('qga out-truncated', socket_path)
                     output = response.get("return", {}).get("out-data", "")
                     decoded_output = base64.b64decode(output).decode("utf-8")
                     #print(decoded_output.strip())
@@ -1787,6 +1799,12 @@ linux_full_cmd = 'echo SSHD ===START;systemctl status ssh|grep -c "Active: activ
 win_full_cmd = 'chcp 65001 & echo IPADDR ===START & ipconfig & echo IPROUTE ===START & route print -4 & echo HOSTNAME ===START & hostname & echo DNSCLI ===START & netsh interface ipv4 show dns'
 #linux_full_cmd = 'echo DNSSERVER ===START;systemctl status named;echo IPADDR ===START;ip a;echo IPROUTE ===START;ip r;echo HOSTNAME ===START;hostname;echo FORWARDING ===START;sysctl net.ipv4.ip_forward;echo DNSCLI ===START;cat /etc/resolv.conf;echo NFTSERVICE ===START;systemctl status nftables;echo DHCPDINSTALL ===START;dpkg -l |grep -c isc-dhcp-server'
 linux_nftrules_cmd = 'nft list ruleset'
+# Секции, которые обязаны быть в выводе полного скрипта опроса. Если вывод
+# с узла пришёл оборванным (например, гонка в qemu-guest-agent на выходе
+# процесса), недостающие секции дозаполняются пустышками, чтобы обращение
+# к ним не роняло всю проверку KeyError'ом.
+LINUX_SECTIONS = ('SSHD', 'DNSSERVER', 'IPADDR', 'IPROUTE', 'HOSTNAME', 'FORWARDING', 'DNSCLI', 'NFTSERVICE', 'DHCPDINSTALL', 'DHCPDRUN')
+WIN_SECTIONS = ('IPADDR', 'IPROUTE', 'HOSTNAME', 'DNSCLI')
 @app.get("/ping")
 async def ping(request: Request, fmt: str = Query('auto')):
     try:
@@ -1974,6 +1992,19 @@ async def ping(request: Request, fmt: str = Query('auto')):
                             elif current_section is not None:
                                 script_OUT[current_section].append(line)
                         dict_of_name_fullcmd[fullcmdout[0]] = script_OUT
+
+                # Оборванный вывод с узла раньше ронял всю проверку KeyError'ом
+                # при первом обращении к отсутствующей секции — дозаполняем
+                # пустышками и показываем проблему в отчёте
+                for fullcmdout in list_of_fullcmdout:
+                    expected = LINUX_SECTIONS if fullcmdout[3] == 'linux' else WIN_SECTIONS
+                    secs = dict_of_name_fullcmd.setdefault(fullcmdout[0], {})
+                    missing = [s for s in expected if s not in secs]
+                    for s in missing:
+                        secs[s] = ['NONE']
+                    if missing:
+                        errors['errors_noty'].append(f'Неполный вывод с узла {fullcmdout[0]}, недостающие разделы: {", ".join(missing)}')
+                        log('incomplete fullcmd output', f'{fullcmdout[0]}: {missing}')
                 tasks = []
                 for name in list_of_vmnames:
                     if dict_of_name_and_ostype[name] == 'linux':

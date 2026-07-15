@@ -62,9 +62,127 @@
   .none { color: #c2cad3; }
   .done-dot { color: var(--ok); font-size: 11px; }
   td.total { font-weight: 700; font-variant-numeric: tabular-nums; }
+
+  /* кликабельная ячейка с оценкой */
+  button.cellbtn { font: inherit; border: none; background: none; cursor: pointer; padding: 0; }
+  button.cellbtn:hover .g { box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--accent); }
+
+  /* модальное окно */
+  .overlay { position: fixed; inset: 0; background: rgba(20,30,45,.45); display: none;
+    align-items: center; justify-content: center; padding: 20px; z-index: 50; }
+  .overlay.open { display: flex; }
+  .modal { background: var(--card); border-radius: 14px; width: 560px; max-width: 100%;
+    max-height: 85vh; display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 12px 40px rgba(0,0,0,.25); }
+  .modal-head { display: flex; align-items: baseline; justify-content: space-between;
+    gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  .modal-head h3 { margin: 0; font-size: 16px; }
+  .modal-head .sub { color: var(--muted); font-size: 13px; }
+  .modal-close { border: none; background: none; font-size: 22px; line-height: 1; cursor: pointer;
+    color: var(--muted); padding: 0 4px; }
+  .modal-body { padding: 14px 18px; overflow-y: auto; }
+  .modal-body > h4 { margin: 4px 0 8px; font-size: 13px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .03em; }
+
+  .badges { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .badge { font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line);
+    white-space: nowrap; }
+  .badge.muted { color: var(--muted); }
+  .ts { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+  details.attempt { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0;
+    background: #fbfcfd; }
+  details.attempt > summary { cursor: pointer; list-style: none; padding: 8px 12px;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  details.attempt > summary::-webkit-details-marker { display: none; }
+  details.attempt > summary::before { content: "▸"; color: var(--muted); font-size: 12px; }
+  details.attempt[open] > summary::before { content: "▾"; }
+  details.attempt[open] > summary { border-bottom: 1px solid var(--line); }
+
+  table.checks { width: calc(100% - 24px); margin: 8px 12px; border-collapse: collapse;
+    font-size: 14px; }
+  .checks th, .checks td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  .checks th { color: var(--muted); font-weight: 500; font-size: 12px;
+    text-transform: uppercase; letter-spacing: .03em; }
+  .checks td:last-child, .checks th:last-child { text-align: right; white-space: nowrap;
+    font-variant-numeric: tabular-nums; }
+  .row-ok td:last-child { color: var(--ok); }
+  .row-bad td:last-child { color: var(--bad); font-weight: 600; }
+  .row-zero td { color: var(--muted); }
+  .row-penalty td { color: var(--bad); font-weight: 600; background: #fdf3f3; }
+
+  .errors { margin: 8px 12px; background: #fdf3f3; border: 1px solid #f2cccc;
+    border-radius: 10px; padding: 8px 12px; }
+  .errors-title { font-weight: 600; color: #8a2020; margin-bottom: 4px; }
+  .errors ul { margin: 4px 0 0; padding-left: 18px; }
+  .errors li { color: #7a2b2b; }
 </style>
 </head>
 <body>
+{# Детальная разбивка одной попытки: баллы по проверкам, штрафы, замечания #}
+{% macro detail(a) %}
+  <table class="checks">
+    <thead><tr><th>Проверка</th><th>Баллы</th></tr></thead>
+    <tbody>
+    {% for it in a['items'] %}
+      <tr class="{% if it.max == 0 %}row-zero{% elif it.score == it.max %}row-ok{% else %}row-bad{% endif %}">
+        <td>{{ it.name }}</td>
+        <td>{{ it.score }} / {{ it.max }}</td>
+      </tr>
+    {% endfor %}
+    {% for pname, p in a['penalties'].items() %}
+      <tr class="row-penalty">
+        <td>{{ pname }} (штраф)</td>
+        <td>−{{ p.points if p.points is defined else p }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if a['errors'] %}
+  <div class="errors">
+    <div class="errors-title">Замечания</div>
+    <ul>{% for e in a['errors'] %}<li>{{ e }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+{% endmacro %}
+
+{# Содержимое модалки для одной ячейки: последняя попытка + вся история #}
+{% macro cell_modal(name, lab, c) %}
+  <div class="modal-head">
+    <div>
+      <h3>{{ name }}</h3>
+      <div class="sub">{{ lab }} · попыток: {{ c.count }}</div>
+    </div>
+    <button type="button" class="modal-close" data-close>×</button>
+  </div>
+  <div class="modal-body">
+    {% if c.latest %}
+    <h4>Последняя попытка</h4>
+    <div class="badges" style="margin-bottom:6px">
+      <span class="ts">{{ c.latest.ts }}</span>
+      <span class="badge g g{{ c.latest.grade if c.latest.grade in [2,3,4,5] else 2 }}">Оценка {{ c.latest.grade }}</span>
+      <span class="badge">{{ c.latest.score }} / {{ c.latest.maxscore }}</span>
+      {% if c.latest.done %}<span class="badge g5">зачёт ✓</span>{% endif %}
+      {% if c.latest.clientip %}<span class="badge muted">{{ c.latest.clientip }}</span>{% endif %}
+    </div>
+    {{ detail(c.latest) }}
+    {% endif %}
+    <h4 style="margin-top:14px">История попыток ({{ c.count }})</h4>
+    {% for a in c.attempts %}
+    <details class="attempt">
+      <summary>
+        <span class="ts">{{ a.ts }}</span>
+        <span class="badge g g{{ a.grade if a.grade in [2,3,4,5] else 2 }}">Оценка {{ a.grade }}</span>
+        <span class="badge">{{ a.score }} / {{ a.maxscore }}</span>
+        {% if a.done %}<span class="badge g5">зачёт ✓</span>{% endif %}
+        {% if a.clientip %}<span class="badge muted">{{ a.clientip }}</span>{% endif %}
+        {% if a.is_best %}<span class="badge muted">лучшая</span>{% endif %}
+      </summary>
+      {{ detail(a) }}
+    </details>
+    {% endfor %}
+  </div>
+{% endmacro %}
 <div class="wrap">
   <header class="top">
     <h1>Сводная по группе</h1>
@@ -124,14 +242,18 @@
             <td class="stud">{{ r.name }}</td>
             {% for lab in selected_labs %}
               {% set c = r.cells[lab] %}
+              {% set cid = 'c-' ~ loop.index0 ~ '-' ~ r.username %}
               <td>
                 {% if c %}
-                  <span class="cell">
-                    <span class="g g{{ c.grade if c.grade in [2,3,4,5] else 2 }}">{{ c.grade if c.grade is not none else '—' }}</span>
-                    <span class="sc">{{ c.score }}/{{ c.max }}
-                      {%- if c.count > 1 %} · {{ c.count }}п{% endif %}
-                      {%- if c.done %} <span class="done-dot">✓</span>{% endif %}</span>
-                  </span>
+                  <button type="button" class="cellbtn" data-modal="{{ cid }}" title="Подробности">
+                    <span class="cell">
+                      <span class="g g{{ c.grade if c.grade in [2,3,4,5] else 2 }}">{{ c.grade if c.grade is not none else '—' }}</span>
+                      <span class="sc">{{ c.score }}/{{ c.max }}
+                        {%- if c.count > 1 %} · {{ c.count }}п{% endif %}
+                        {%- if c.done %} <span class="done-dot">✓</span>{% endif %}</span>
+                    </span>
+                  </button>
+                  <template id="{{ cid }}">{{ cell_modal(r.name, lab, c) }}</template>
                 {% else %}
                   <span class="none">—</span>
                 {% endif %}
@@ -146,12 +268,40 @@
   {% endif %}
 </div>
 
+<div class="overlay" id="overlay">
+  <div class="modal" id="modal" role="dialog" aria-modal="true"></div>
+</div>
+
 <script>
   function toggleAll(form) {
     var boxes = form.querySelectorAll('input[name="labs"]');
     var anyOff = Array.prototype.some.call(boxes, function (b) { return !b.checked; });
     boxes.forEach(function (b) { b.checked = anyOff; });
   }
+
+  var overlay = document.getElementById('overlay');
+  var modal = document.getElementById('modal');
+
+  function openModal(id) {
+    var tpl = document.getElementById(id);
+    if (!tpl) return;
+    modal.innerHTML = '';
+    modal.appendChild(tpl.content.cloneNode(true));
+    overlay.classList.add('open');
+  }
+  function closeModal() {
+    overlay.classList.remove('open');
+    modal.innerHTML = '';
+  }
+
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-modal]');
+    if (btn) { openModal(btn.getAttribute('data-modal')); return; }
+    if (e.target.closest('[data-close]') || e.target === overlay) { closeModal(); }
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') closeModal();
+  });
 </script>
 </body>
 </html>

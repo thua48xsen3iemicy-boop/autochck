@@ -25,6 +25,8 @@ CHECK_LABELS = {
     'joined_to_domain': 'Ввод узлов в домен',
     'multiroutes': 'Маршруты между сетями',
     'special': 'Спецпроверки лабы',
+    'vlan_membership': 'Распределение по VLAN',
+    'vlan_trunks': 'Транки между коммутаторами',
 }
 
 

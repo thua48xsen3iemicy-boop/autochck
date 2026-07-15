@@ -48,8 +48,9 @@
               {{ s.status if s.status is defined else '—' }}</td>
             <td class="score">{{ s.score if s.score is defined else '' }}</td>
             <td class="extra">
+              {%- set labels = labels if labels is defined else {} -%}
               {%- for k, v in s.items() if k not in ['username', 'status', 'score'] -%}
-                {{ k }}: {{ v }}{% if not loop.last %}<br>{% endif %}
+                {{ labels.get(k, k) }}: {{ v }}{% if not loop.last %}<br>{% endif %}
               {%- endfor -%}
             </td>
           </tr>

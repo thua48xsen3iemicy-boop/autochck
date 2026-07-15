@@ -32,6 +32,13 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+# Общий справочник названий проверок (см. check_labels.py). Fallback — пустой
+# словарь, если модуль не задеплоен рядом: тогда показываются сырые ключи.
+try:
+    from check_labels import CHECK_LABELS
+except ImportError:
+    CHECK_LABELS = {}
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -396,7 +403,7 @@ async def summaryinfo(request: Request,
                       labs: Optional[List[str]] = Query(None)):
     groupdirs = sorted(await get_group_pnet(GROUPS_ROOT))
     ctx = {"request": request, "groupdirs": groupdirs, "selected_group": group,
-           "all_labs": [], "selected_labs": [], "rows": []}
+           "all_labs": [], "selected_labs": [], "rows": [], "labels": CHECK_LABELS}
 
     if not group or group not in groupdirs:
         return templates.TemplateResponse(request, "summary.html", ctx)
@@ -443,7 +450,7 @@ async def read_report(request: Request,
     dict_of_labs = dict(zip(groupdirs,
                             await asyncio.gather(*[group_lab_names(g) for g in groupdirs])))
     ctx = {"request": request, "groupdirs": groupdirs, "dict_of_labs": dict_of_labs,
-           "selected_group": group, "selected_lab": lab, "students": []}
+           "selected_group": group, "selected_lab": lab, "students": [], "labels": CHECK_LABELS}
 
     if not group or group not in groupdirs or not lab:
         return templates.TemplateResponse(request, "report.html", ctx)
@@ -512,7 +519,7 @@ async def build_ping_rows(group: str) -> List[dict]:
 
 async def render_ping(request: Request, group: Optional[str] = None):
     students = await build_ping_rows(group) if group else []
-    return templates.TemplateResponse(request, "ping.html", {"students": students})
+    return templates.TemplateResponse(request, "ping.html", {"students": students, "labels": CHECK_LABELS})
 
 
 @app.get("/info", response_class=HTMLResponse)

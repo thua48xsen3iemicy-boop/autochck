@@ -128,20 +128,22 @@
 </style>
 </head>
 <body>
+{# Словарь переводов названий проверок; пустой, если бэкенд не прислал #}
+{% set labels = labels if labels is defined else {} %}
 {# Детальная разбивка одной попытки: баллы по проверкам, штрафы, замечания #}
-{% macro detail(a) %}
+{% macro detail(a, labels) %}
   <table class="checks">
     <thead><tr><th>Проверка</th><th>Баллы</th></tr></thead>
     <tbody>
     {% for it in a['items'] %}
       <tr class="{% if it.max == 0 %}row-zero{% elif it.score == it.max %}row-ok{% else %}row-bad{% endif %}">
-        <td>{{ it.name }}</td>
+        <td>{{ labels.get(it.name, it.name) }}</td>
         <td>{{ it.score }} / {{ it.max }}</td>
       </tr>
     {% endfor %}
     {% for pname, p in a['penalties'].items() %}
       <tr class="row-penalty">
-        <td>{{ pname }} (штраф)</td>
+        <td>{{ labels.get(pname, pname) }} (штраф)</td>
         <td>−{{ p.points if p.points is defined else p }}</td>
       </tr>
     {% endfor %}
@@ -174,7 +176,7 @@
       {% if c.latest.done %}<span class="badge g5">зачёт ✓</span>{% endif %}
       {% if c.latest.clientip %}<span class="badge muted">{{ c.latest.clientip }}</span>{% endif %}
     </div>
-    {{ detail(c.latest) }}
+    {{ detail(c.latest, labels) }}
     {% endif %}
     <h4 style="margin-top:14px">История попыток ({{ c.count }})</h4>
     {% for a in c.attempts %}
@@ -187,7 +189,7 @@
         {% if a.clientip %}<span class="badge muted">{{ a.clientip }}</span>{% endif %}
         {% if a.is_best %}<span class="badge muted">лучшая</span>{% endif %}
       </summary>
-      {{ detail(a) }}
+      {{ detail(a, labels) }}
     </details>
     {% endfor %}
   </div>

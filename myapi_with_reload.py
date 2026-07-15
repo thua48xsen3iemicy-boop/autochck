@@ -136,25 +136,13 @@ PENALTIES = {
     'Forwarding_disable': 10,
 }
 
-# Человекочитаемые названия проверок для отчёта (внутренние ключи оставляем как есть —
-# они используются в CHECK_WEIGHTS/PENALTIES и в check_items).
-CHECK_LABELS = {
-    'Hostnames': 'Имена узлов',
-    'Ip Addresses': 'IP-адреса',
-    'Networks': 'Сети в L2-доменах',
-    'nodup_ipaddr': 'Уникальность IP-адресов',
-    'IP is private': 'Приватные адреса',
-    'Default gw present': 'Шлюз по умолчанию задан',
-    'Default gw good': 'Шлюз по умолчанию корректен',
-    'Forwarding_enable': 'Форвардинг на маршрутизаторах',
-    'Forwarding_disable': 'Форвардинг на клиентах',
-    'dnsclient_ip_addr': 'DNS-клиент',
-    'snat_nftables': 'SNAT (nftables)',
-    'Win Domain': 'Домен Windows',
-    'joined_to_domain': 'Ввод узлов в домен',
-    'multiroutes': 'Маршруты между сетями',
-    'special': 'Спецпроверки лабы',
-}
+# Человекочитаемые названия проверок для отчёта вынесены в общий модуль
+# check_labels.py (используется и reportsrv.py). Fallback — пустой словарь,
+# если файл не задеплоен рядом: тогда показываются сырые ключи.
+try:
+    from check_labels import CHECK_LABELS
+except ImportError:
+    CHECK_LABELS = {}
 
 def save_run(run, checks, db_path=RESULT_DB_PATH):
     """Сохраняет один прогон (runs) и разбивку по проверкам (check_items). Возвращает run_id.

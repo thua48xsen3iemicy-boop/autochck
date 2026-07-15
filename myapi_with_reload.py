@@ -1795,7 +1795,7 @@ async def results(request: Request):
 async def read_report(request: Request):
     return await render_dashboard(request)
 
-linux_full_cmd = 'echo SSHD ===START;systemctl status ssh|grep -c "Active: active (running)";echo DNSSERVER ===START;systemctl status named|grep -c "Active: active (running)";echo IPADDR ===START;ip -d a;echo IPROUTE ===START;ip r;echo HOSTNAME ===START;hostname;echo FORWARDING ===START;sysctl net.ipv4.ip_forward;echo DNSCLI ===START;command -v resolvectl >/dev/null && resolvectl status | awk "/Current DNS Server/ {print \"nameserver \" \$NF}" || cat /etc/resolv.conf;echo NFTSERVICE ===START;systemctl status nftables;echo DHCPDINSTALL ===START;dpkg -l |grep -c isc-dhcp-server;echo DHCPDRUN ===START;systemctl status isc-dhcp-server |grep -c "Active: active (running)"'
+linux_full_cmd = 'echo SSHD ===START;systemctl status ssh|grep -c "Active: active (running)";echo DNSSERVER ===START;systemctl status named|grep -c "Active: active (running)";echo IPADDR ===START;ip -d a || ip a;echo IPROUTE ===START;ip r;echo HOSTNAME ===START;hostname;echo FORWARDING ===START;sysctl net.ipv4.ip_forward;echo DNSCLI ===START;command -v resolvectl >/dev/null && resolvectl status | awk "/Current DNS Server/ {print \"nameserver \" \$NF}" || cat /etc/resolv.conf;echo NFTSERVICE ===START;systemctl status nftables;echo DHCPDINSTALL ===START;dpkg -l |grep -c isc-dhcp-server;echo DHCPDRUN ===START;systemctl status isc-dhcp-server |grep -c "Active: active (running)"'
 win_full_cmd = 'chcp 65001 & echo IPADDR ===START & ipconfig & echo IPROUTE ===START & route print -4 & echo HOSTNAME ===START & hostname & echo DNSCLI ===START & netsh interface ipv4 show dns'
 #linux_full_cmd = 'echo DNSSERVER ===START;systemctl status named;echo IPADDR ===START;ip a;echo IPROUTE ===START;ip r;echo HOSTNAME ===START;hostname;echo FORWARDING ===START;sysctl net.ipv4.ip_forward;echo DNSCLI ===START;cat /etc/resolv.conf;echo NFTSERVICE ===START;systemctl status nftables;echo DHCPDINSTALL ===START;dpkg -l |grep -c isc-dhcp-server'
 linux_nftrules_cmd = 'nft list ruleset'
@@ -2188,6 +2188,12 @@ async def ping(request: Request, fmt: str = Query('auto')):
                     if dict_of_name_and_ostype[name] == 'linux':
                         gre_present = False
                         linux_ints = {}
+                        # Обязательная инициализация: если секция IPADDR пуста или
+                        # начинается не с заголовка интерфейса (оборванный вывод,
+                        # заглушка 'NONE'), переменная раньше оставалась
+                        # неинициализированной и роняла проверку UnboundLocalError,
+                        # а между узлами протекало значение прошлой итерации
+                        current_interface = None
                         for line in dict_of_name_fullcmd[name]['IPADDR']:
                             if 'gre' in line:
                                 gre_present = True

@@ -1674,6 +1674,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         handler = pexpect.spawnu(f'telnet 127.0.0.1 {port}', maxread=100000)
         tasks.append(asyncio.ensure_future(execute_command_cisco(handler, name)))
     switch_data = {}
+    switch_hostnames = {}
     for name, sections in await asyncio.gather(*tasks):
         if isinstance(sections, dict) and sections.get('VLAN'):
             switch_data[name] = {
@@ -1681,8 +1682,17 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
                 'trunks': parse_int_trunk(sections.get('TRUNK', [])),
                 'intstat': parse_int_status(sections.get('INTSTAT', [])),
             }
+            # Хостнейм свитча — из строки "hostname X" секции RUNCONF;
+            # уходит в общую проверку "Имена узлов"
+            switch_hostnames[name] = 'NONE'
+            for line in sections.get('RUNCONF', []):
+                m = re.match(r'\s*hostname\s+(\S+)', line)
+                if m:
+                    switch_hostnames[name] = m.group(1)
+                    break
         else:
             errs.append(f'L2: не удалось опросить коммутатор {name}')
+            switch_hostnames[name] = 'NONE'
 
     links, sw_links, facing = build_switch_links(switches, dict_of_name_and_intname, bridges)
 
@@ -1862,6 +1872,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
             'unused': unused_result,
             'extra_vlans': (extra_plain, extra_used),
             'port_down': port_down,
+            'hostnames': switch_hostnames,
             'errors': errs, 'debug': debug,
             'groups': groups, 'switches': switches,
             'facing': facing, 'switch_data': switch_data}
@@ -2300,6 +2311,8 @@ async def ping(request: Request, fmt: str = Query('auto')):
                     add_penalty('vlan_extra', l2res['extra_vlans'][0])
                     add_penalty('vlan_extra_used', l2res['extra_vlans'][1])
                     add_penalty('vlan_port_shutdown', l2res['port_down'])
+                    # Хостнеймы свитчей — в общую проверку "Имена узлов"
+                    dict_of_vmnames_hostname.update(l2res['hostnames'])
                 # =============== L2 MULTISWITCH (VLAN) END ===============
 
 

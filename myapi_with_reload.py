@@ -1340,8 +1340,11 @@ def read_json_file(file_path):
     return data
 
 
-def node_ciscoenable(handler):
+def node_ciscoenable(handler, secret=None):
     ''' Поднимаемся из user exec (>) в privileged exec (#), вводя enable-пароль при необходимости '''
+    # secret задаётся подсказкой лабы (cisco_pass:...); None — дефолтный cissecret
+    if secret is None:
+        secret = cissecret
     handler.sendline('enable')
     try:
         j = handler.expect(['Password:', '#'], timeout = cisexpctimeout)
@@ -1350,7 +1353,7 @@ def node_ciscoenable(handler):
         node_ciscoquit(handler)
         return False
     if j == 0:
-        handler.sendline(cissecret)
+        handler.sendline(secret)
         try:
             handler.expect('#', timeout = cisexpctimeout)
         except:
@@ -1359,7 +1362,8 @@ def node_ciscoenable(handler):
             return False
     return True
 
-def node_ciscologin(handler):
+def node_ciscologin(handler, secret=None):
+    # secret прокидывается в node_ciscoenable (enable-пароль из подсказки лабы)
     # Send an empty line, and wait for the login prompt.
     # Общий дедлайн cistimeout: мёртвая консоль (EOF, молчание, незнакомый prompt)
     # иначе крутила бы этот цикл вечно в executor-потоке вместе с /tmp/chk.lock.
@@ -1405,7 +1409,7 @@ def node_ciscologin(handler):
             return False
 
         if j == 0:
-            return node_ciscoenable(handler)
+            return node_ciscoenable(handler, secret)
         return True
     elif i == 1:
         # Пароль на линии (line con 0 + password/login) — приглашение без Username
@@ -1417,7 +1421,7 @@ def node_ciscologin(handler):
             node_ciscoquit(handler)
             return False
         if j == 0:
-            return node_ciscoenable(handler)
+            return node_ciscoenable(handler, secret)
         return True
     elif i == 2:
         # Config mode detected, need to exit
@@ -1431,7 +1435,7 @@ def node_ciscologin(handler):
         return True
     elif i == 3:
         # Need higher privilege
-        return node_ciscoenable(handler)
+        return node_ciscoenable(handler, secret)
     elif i == 4:
         # Nothing to do
         return True
@@ -1553,8 +1557,8 @@ def config_ciscoget(handler):
     dict_of_cisco_script = script_OUT
     return dict_of_cisco_script
 
-def run_on_viosl2(handler):
-    rc = node_ciscologin(handler)
+def run_on_viosl2(handler, secret=None):
+    rc = node_ciscologin(handler, secret)
     if rc != True:
         print('ERROR: failed to login.')
         node_ciscoquit(handler)
@@ -1569,9 +1573,9 @@ def run_on_viosl2(handler):
 
     return config
 
-async def execute_command_cisco(handler, name):
+async def execute_command_cisco(handler, name, secret=None):
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, run_on_viosl2, handler)
+    result = await loop.run_in_executor(None, run_on_viosl2, handler, secret)
     if not result:
         result = 'NONE'
     if result == 'err':
@@ -1673,6 +1677,30 @@ def parse_l2_hint(lab_file):
         if members:
             groups.append({'vlan': vlan, 'members': members})
     return groups
+
+def parse_cisco_pass(lab_file):
+    """Читает enable-пароль из <description> лабы, если он там задан.
+
+    Преподаватель может дописать в описание маркер 'cisco_pass:MyPASS'
+    (регистр слова не важен, пробелы вокруг двоеточия допустимы). Пароль —
+    последовательность непробельных символов после двоеточия.
+
+    Возвращает строку пароля либо None, если маркера нет. При None вызывающий
+    код работает как раньше — с дефолтным cissecret.
+    """
+    try:
+        with open(lab_file, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError as e:
+        log('parse_cisco_pass read err', e)
+        return None
+    m = re.search(r'<description>(.*?)</description>', content, re.DOTALL)
+    if not m:
+        return None
+    pm = re.search(r'cisco_pass\s*:\s*(\S+)', m.group(1), re.IGNORECASE)
+    if pm:
+        return pm.group(1)
+    return None
 
 def parse_vlan_list(text):
     """'1,10,20-22' -> {1, 10, 20, 21, 22}; 'none' -> пустое множество."""
@@ -1922,6 +1950,11 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
 
     errs = []
 
+    # enable-пароль из описания лабы (cisco_pass:...); None — дефолтный cissecret
+    cisco_secret = parse_cisco_pass(lab_file)
+    if cisco_secret is not None:
+        log('l2 cisco enable password from description hint')
+
     # Повторный опрос свитчей, независимый от основного прохода
     tasks = []
     for name in switches:
@@ -1935,7 +1968,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         else:
             port = int(path.split('/')[1]) + 30000
         handler = pexpect.spawnu(f'telnet 127.0.0.1 {port}', maxread=100000)
-        tasks.append(asyncio.ensure_future(execute_command_cisco(handler, name)))
+        tasks.append(asyncio.ensure_future(execute_command_cisco(handler, name, cisco_secret)))
     switch_data = {}
     switch_hostnames = {}
     for name, sections in await asyncio.gather(*tasks):

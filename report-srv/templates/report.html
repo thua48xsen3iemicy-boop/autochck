@@ -76,6 +76,15 @@
   .errors-title { font-weight: 600; color: #8a2020; margin-bottom: 4px; }
   .errors ul { margin: 4px 0 0; padding-left: 18px; }
   .errors li { color: #7a2b2b; }
+
+  details.collected { margin: 8px 12px; }
+  details.collected > summary { cursor: pointer; color: var(--accent); font-size: 13px; padding: 4px 0; }
+  details.ci-item { border: 1px solid var(--line); border-radius: 8px; margin: 6px 0; background: #fff; }
+  details.ci-item > summary { cursor: pointer; padding: 6px 10px; font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  details.ci-item pre { margin: 0; padding: 8px 10px; border-top: 1px solid var(--line);
+    background: #f8fafc; overflow-x: auto; font-size: 12px; line-height: 1.45;
+    white-space: pre-wrap; word-break: break-word; }
 </style>
 </head>
 <body>
@@ -105,6 +114,17 @@
     <div class="errors-title">Замечания</div>
     <ul>{% for e in a['errors'] %}<li>{{ e }}</li>{% endfor %}</ul>
   </div>
+  {% endif %}
+  {% if a['collected'] %}
+  <details class="collected">
+    <summary>Собранная информация ({{ a['collected']|length }})</summary>
+    {% for key, value in a['collected'].items() %}
+    <details class="ci-item">
+      <summary>{{ key }}</summary>
+      <pre>{% if value is string %}{{ value }}{% else %}{{ value | tojson(indent=2) }}{% endif %}</pre>
+    </details>
+    {% endfor %}
+  </details>
   {% endif %}
 {% endmacro %}
 <div class="wrap">

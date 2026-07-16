@@ -29,6 +29,8 @@ CHECK_LABELS = {
     'vlan_trunks': 'Транки между коммутаторами',
     'vlan_router_int': 'Маршрутизатор в каждом VLAN',
     'vlan_unused_ports': 'Отключение неиспользуемых портов',
+    'vlan_extra': 'Лишние VLAN',
+    'vlan_extra_used': 'Лишний VLAN на порту узла',
 }
 
 

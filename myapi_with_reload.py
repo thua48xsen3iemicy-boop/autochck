@@ -134,6 +134,11 @@ CHECK_WEIGHTS = {
 # указанное число баллов из итогового счёта. Значение — штраф за каждый узел-нарушитель.
 PENALTIES = {
     'Forwarding_disable': 10,
+    # Лишний VLAN на коммутаторе (создан, но заданию не соответствует) — мягко
+    'vlan_extra': 1,
+    # Лишний VLAN, фактически назначенный на порт узла из подсказки, —
+    # это уже ошибка конфигурации
+    'vlan_extra_used': 3,
 }
 
 # Человекочитаемые названия проверок для отчёта вынесены в общий модуль
@@ -1791,19 +1796,32 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
             errs.append(f'L2: на {sw} не выключены неиспользуемые порты: {", ".join(bad)} (нужен shutdown)')
     unused_result = (u_total - u_wrong, u_total) if u_total else None
 
-    # Лишние VLAN'ы на коммутаторах — не совпадающие ни с одной группой задания
-    # (уведомление без баллов: обычно сопровождает изоляцию/членство)
+    # Лишние VLAN'ы на коммутаторах — не совпадающие ни с одной группой задания.
+    # Просто созданный лишний VLAN — мягкий штраф (vlan_extra); лишний VLAN,
+    # назначенный на порт, ведущий к узлу из подсказки, — ошибка конфигурации
+    # (vlan_extra_used, штраф ощутимее)
     expected_vlans = {g['vlan'] for g in groups if g['vlan']}
+    hinted_nodes = set(member_count)
+    extra_plain = 0
+    extra_used = 0
     for sw in switches:
         data = switch_data.get(sw)
         if not data:
             continue
+        member_ports = {p for p, peers in links.get(sw, {}).items()
+                        if any(peer in hinted_nodes for peer in peers)}
         for vid, vports in sorted(data['vlans'].items()):
             if vid == 1 or 1002 <= vid <= 1005 or vid in expected_vlans:
                 continue
-            if vports:
+            used = sorted(vports & member_ports)
+            if used:
+                extra_used += 1
+                errs.append(f'L2: на {sw} лишний VLAN {vid} на порту узла ({", ".join(used)}) — ошибка конфигурации')
+            elif vports:
+                extra_plain += 1
                 errs.append(f'L2: на {sw} лишний VLAN {vid} (порты: {", ".join(sorted(vports))}) — заданию он не соответствует')
             else:
+                extra_plain += 1
                 errs.append(f'L2: на {sw} создан VLAN {vid}, не соответствующий ни одной группе задания')
 
     # Порты узлов из подсказки, оставшиеся в VLAN 1 — "порт не настроен"
@@ -1826,6 +1844,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
     # (build_l2_domains) после разбора адресов
     return {'membership': (total - wrong, total), 'trunks': trunks_result,
             'unused': unused_result,
+            'extra_vlans': (extra_plain, extra_used),
             'errors': errs, 'debug': debug,
             'groups': groups, 'switches': switches,
             'facing': facing, 'switch_data': switch_data}
@@ -1976,12 +1995,10 @@ async def ping(request: Request, fmt: str = Query('auto')):
 
         brief = {}
         tasks = []
-        cisco_tmps = []
         routeros_tmps = []
         iptasks = []
         output_dict = {}
         dict_of_name_routeros_script = {}
-        dict_of_name_cisco_script = {}
         dict_of_name_winservers_script = {}
         dict_of_intnames_ipaddr = {}
         # Реальный адрес интерфейса, сохраняется даже когда статус схлопнут в MULTI,
@@ -2134,24 +2151,19 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         dict_of_vmnames_hostname[name] = dict_of_name_fullcmd[name]['HOSTNAME'][0]
                 answer['dict_of_vmnames_hostname'] = dict_of_vmnames_hostname
 
+                # Коммутаторы (viosl2) здесь больше не опрашиваются: их целиком
+                # опрашивает L2-блок (check_l2_vlans), иначе каждый свитч
+                # дёргался по консоли дважды за прогон
                 for name in list_of_vmnames:
-                    if dict_of_name_and_ostype[name] == 'viosl2':
-                        tmpport = dict_of_name_and_path[name]
-                        port = int(tmpport.split('/')[1]) + 30000
-                        cis_handler = pexpect.spawnu(f'telnet 127.0.0.1 {port}', maxread=100000)
-                        cisco_tmp = asyncio.ensure_future(execute_command_cisco(cis_handler, name))
-                        cisco_tmps.append(cisco_tmp)                       
-
-                    elif dict_of_name_and_ostype[name] == 'mikrotik':
+                    if dict_of_name_and_ostype[name] == 'mikrotik':
                         tmpport = dict_of_name_and_path[name]
                         port = int(tmpport.split('/')[1]) + 30000
                         # run_on_routeros открывает telnet сам; лишний spawnu здесь
                         # оставлял по неиспользуемому подключению на каждый узел
                         routeros_tmp = asyncio.ensure_future(execute_command_routeros(mikrot_script, port, name))
                         routeros_tmps.append(routeros_tmp)
-                
+
                 ipresult = await asyncio.gather(*iptasks)
-                cisco_results = await asyncio.gather(*cisco_tmps)
                 routeros_results = await asyncio.gather(*routeros_tmps)
                 answer['mikrotik_raw_output'] = routeros_results
                 for routeros_result in routeros_results:
@@ -2245,25 +2257,13 @@ async def ping(request: Request, fmt: str = Query('auto')):
 
 
 
-                for cisco_result in cisco_results:
-                    # run_on_viosl2 при неудаче возвращает ['err', 'login'|'output'] —
-                    # раньше это молча оседало в отладочном словаре
-                    if isinstance(cisco_result[1], list) and cisco_result[1][:1] == ['err']:
-                        reason = 'не удалось войти (проверьте пароли)' if cisco_result[1][1] == 'login' else 'не удалось прочитать вывод'
-                        errors['errors_noty'].append(f'Проблемы на {cisco_result[0]}: {reason}')
-                        dict_of_name_cisco_script[cisco_result[0]] = {}
-                    else:
-                        dict_of_name_cisco_script[cisco_result[0]] = cisco_result[1]
-
-                answer['dict_of_name_cisco_script'] = dict_of_name_cisco_script
-
                 answer['dict_of_vmnames_hostname'] = dict_of_vmnames_hostname
                 answer['dict_of_name_routeros_script'] = dict_of_name_routeros_script
 
                 # =============== L2 MULTISWITCH (VLAN) ===============
-                # Отдельный проход: коммутаторы опрашиваются повторно, подсказка
-                # берётся из <description> лабы. Ошибка внутри блока не роняет
-                # остальную проверку.
+                # Единственное место опроса коммутаторов; подсказка берётся из
+                # <description> лабы. Ошибка внутри блока не роняет остальную
+                # проверку.
                 try:
                     l2res = await check_l2_vlans(lab_path, dict_of_name_and_ostype,
                                                  dict_of_name_and_intname,
@@ -2279,6 +2279,9 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         add_check('vlan_trunks', l2res['trunks'][0], l2res['trunks'][1])
                     if l2res['unused']:
                         add_check('vlan_unused_ports', l2res['unused'][0], l2res['unused'][1])
+                    # Штрафы за лишние VLAN'ы: max не меняют, вычитаются из итога
+                    add_penalty('vlan_extra', l2res['extra_vlans'][0])
+                    add_penalty('vlan_extra_used', l2res['extra_vlans'][1])
                 # =============== L2 MULTISWITCH (VLAN) END ===============
 
 

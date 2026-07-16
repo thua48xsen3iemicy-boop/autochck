@@ -1487,6 +1487,24 @@ def parse_int_trunk(lines):
             trunks[parts[0]] = parse_vlan_list(parts[1])
     return trunks
 
+def parse_int_status(lines):
+    """Секция INTSTAT (show int status) -> {порт: статус}.
+
+    Статусы: connected / notconnect / disabled (shutdown) / err-disabled...
+    Статус ищем по известным токенам, потому что колонка Name может быть
+    пустой или содержать пробелы.
+    """
+    statuses = {}
+    known = ('connected', 'notconnect', 'disabled', 'err-disabled', 'suspended', 'monitoring')
+    for line in lines:
+        parts = line.split()
+        if not parts or not re.match(r'^[A-Za-z]{2,4}\d+/\d+$', parts[0]):
+            continue
+        status = next((p for p in parts[1:] if p in known), None)
+        if status:
+            statuses[parts[0]] = status
+    return statuses
+
 def build_switch_links(switch_names, dict_of_name_and_intname, bridges):
     """Схема подключений по линукс-бриджам (tap vunlX_N <-> сосед по бриджу).
 
@@ -1540,6 +1558,11 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
       - роутер с отдельными ногами в свитчи — тем tap'ом, чей порт свитча
         фактически находится в vlan группы (разрешение неоднозначности).
     Бриджи без участия свитча (p2p-линки, pnet0) сохраняются как есть.
+
+    Возвращает (новые бриджи, сообщения для отчёта, router_int_result):
+    router_int_result — (score, max) проверки "роутер присутствует в каждом
+    своём VLAN-домене" (изоляция сети базовой проверкой не покрывается),
+    либо None, если в подсказке нет узлов из нескольких групп.
     """
     switches = set(l2res['switches'])
     switch_taps = set()
@@ -1551,6 +1574,9 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
         if not switch_taps & set(ports):
             new_bridges[bname] = ports
 
+    errs = []
+    r_total = 0
+    r_wrong = 0
     member_count = Counter(m for g in l2res['groups'] for m in g['members'])
     for idx, g in enumerate(l2res['groups'], 1):
         vid = g['vlan']
@@ -1559,11 +1585,13 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
         for member in g['members']:
             if member in switches:
                 continue
+            contributed = False
             for tap, sw, pname in l2res['facing'].get(member, []):
                 subints = dict_of_subints.get(tap, {})
                 if vid and vid in subints:
                     # роутер-на-палочке: в домен идёт сабинтерфейс нужного vlan
                     dports.append(subints[vid])
+                    contributed = True
                 elif subints:
                     # у ноги есть сабинтерфейсы, но не в vlan этой группы —
                     # роутеру нечем присутствовать в домене; физический tap
@@ -1576,11 +1604,36 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
                     data = l2res['switch_data'].get(sw, {})
                     if pname in data.get('vlans', {}).get(vid, set()) or vid in data.get('trunks', {}).get(pname, set()):
                         dports.append(tap)
+                        contributed = True
                 else:
                     dports.append(tap)
+                    contributed = True
+            # Изоляция: узел из нескольких групп (роутер) обязан присутствовать
+            # в каждом своём домене — сабинтерфейсом или отдельной ногой
+            if member_count[member] > 1:
+                r_total += 1
+                if not contributed:
+                    r_wrong += 1
+                    if vid:
+                        errs.append(f'L2: VLAN {vid} (группа: {", ".join(g["members"])}) — у {member} нет интерфейса в этом VLAN, сеть изолирована от маршрутизатора')
         if dports:
             new_bridges[domain] = sorted(set(dports))
-    return new_bridges
+
+    # Лишние сабинтерфейсы: vlan id, не соответствующий ни одной группе узла
+    # (недостающие уже покрыты сообщением об изоляции выше)
+    member_vlans = {}
+    for g in l2res['groups']:
+        for member in g['members']:
+            member_vlans.setdefault(member, set()).add(g['vlan'])
+    for member, flist in l2res['facing'].items():
+        expected = {v for v in member_vlans.get(member, set()) if v}
+        for tap, _sw, _pname in flist:
+            for svid in sorted(dict_of_subints.get(tap, {})):
+                if svid not in expected:
+                    errs.append(f'L2: у {member} сабинтерфейс в VLAN {svid}, не соответствующий ни одной группе задания')
+
+    router_int_result = (r_total - r_wrong, r_total) if r_total else None
+    return new_bridges, errs, router_int_result
 
 async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_intname, dict_of_name_and_path, bridges):
     """Проверка L2: распределение узлов по VLAN и транки между коммутаторами.
@@ -1618,6 +1671,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
             switch_data[name] = {
                 'vlans': parse_vlan_brief(sections['VLAN']),
                 'trunks': parse_int_trunk(sections.get('TRUNK', [])),
+                'intstat': parse_int_status(sections.get('INTSTAT', [])),
             }
         else:
             errs.append(f'L2: не удалось опросить коммутатор {name}')
@@ -1719,6 +1773,48 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         if t_total:
             trunks_result = (t_total - t_wrong, t_total)
 
+    # Незадействованные порты коммутаторов должны быть выключены (shutdown).
+    # Считаем по свитчу (один элемент = "на свитче все лишние порты погашены"),
+    # чтобы полтора десятка портов не задавили весь остальной счёт.
+    u_total = 0
+    u_wrong = 0
+    for sw in switches:
+        data = switch_data.get(sw)
+        if not data or not data['intstat']:
+            continue
+        wired = set(links.get(sw, {}))
+        u_total += 1
+        bad = sorted(p for p, st in data['intstat'].items()
+                     if p not in wired and st != 'disabled')
+        if bad:
+            u_wrong += 1
+            errs.append(f'L2: на {sw} не выключены неиспользуемые порты: {", ".join(bad)} (нужен shutdown)')
+    unused_result = (u_total - u_wrong, u_total) if u_total else None
+
+    # Лишние VLAN'ы на коммутаторах — не совпадающие ни с одной группой задания
+    # (уведомление без баллов: обычно сопровождает изоляцию/членство)
+    expected_vlans = {g['vlan'] for g in groups if g['vlan']}
+    for sw in switches:
+        data = switch_data.get(sw)
+        if not data:
+            continue
+        for vid, vports in sorted(data['vlans'].items()):
+            if vid == 1 or 1002 <= vid <= 1005 or vid in expected_vlans:
+                continue
+            if vports:
+                errs.append(f'L2: на {sw} лишний VLAN {vid} (порты: {", ".join(sorted(vports))}) — заданию он не соответствует')
+            else:
+                errs.append(f'L2: на {sw} создан VLAN {vid}, не соответствующий ни одной группе задания')
+
+    # Порты узлов из подсказки, оставшиеся в VLAN 1 — "порт не настроен"
+    for member, plist in node_ports.items():
+        if member_count.get(member, 0) == 0:
+            continue
+        for sw, pname in plist:
+            data = switch_data.get(sw)
+            if data and pname in data['vlans'].get(1, set()):
+                errs.append(f'L2: порт {pname} на {sw} (узел {member}) остался в VLAN 1 — порт не настроен')
+
     debug = {
         'groups': [{'vlan': g['vlan'], 'members': g['members']} for g in groups],
         'links': links,
@@ -1729,6 +1825,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
     # groups/switches/facing/switch_data нужны шагу подмены L1 -> L2
     # (build_l2_domains) после разбора адресов
     return {'membership': (total - wrong, total), 'trunks': trunks_result,
+            'unused': unused_result,
             'errors': errs, 'debug': debug,
             'groups': groups, 'switches': switches,
             'facing': facing, 'switch_data': switch_data}
@@ -2180,6 +2277,8 @@ async def ping(request: Request, fmt: str = Query('auto')):
                     add_check('vlan_membership', l2res['membership'][0], l2res['membership'][1])
                     if l2res['trunks']:
                         add_check('vlan_trunks', l2res['trunks'][0], l2res['trunks'][1])
+                    if l2res['unused']:
+                        add_check('vlan_unused_ports', l2res['unused'][0], l2res['unused'][1])
                 # =============== L2 MULTISWITCH (VLAN) END ===============
 
 
@@ -2344,7 +2443,13 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 # топологии — дальше базовая логика идёт без изменений.
                 if l2res:
                     try:
-                        bridges = build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints)
+                        bridges, l2dom_errs, router_int_result = build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints)
+                        errors['errors_noty'].extend(l2dom_errs)
+                        # Изоляция сети от роутера не покрывается базовыми
+                        # проверками (особенно при подсказке без номеров) —
+                        # отдельный пункт с баллами
+                        if router_int_result:
+                            add_check('vlan_router_int', router_int_result[0], router_int_result[1])
                         answer['l2_domains'] = str(bridges)
                         answer['l2_subints'] = str(dict_of_subints)
                     except Exception:

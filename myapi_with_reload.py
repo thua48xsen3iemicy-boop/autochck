@@ -1564,6 +1564,12 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
                 if vid and vid in subints:
                     # роутер-на-палочке: в домен идёт сабинтерфейс нужного vlan
                     dports.append(subints[vid])
+                elif subints:
+                    # у ноги есть сабинтерфейсы, но не в vlan этой группы —
+                    # роутеру нечем присутствовать в домене; физический tap
+                    # добавлять нельзя: он выведен из проверок как безадресный
+                    # родитель сабинтерфейсов
+                    continue
                 elif member_count[member] > 1 and vid:
                     # несколько ног в свитчи: берём tap, чей порт фактически
                     # в vlan группы (access или trunk с этим vlan)
@@ -1729,6 +1735,9 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
 ############################################################ L2 MULTISWITCH END
 
 def int_of_ostype(i, d1, d2):
+    # exit_key обязан быть инициализирован: для инта, не найденного ни у
+    # одного узла, функция падала UnboundLocalError и роняла всю проверку
+    exit_key = None
     for key, val in d1.items():
         if isinstance(val, list):
             if i in val:
@@ -1736,6 +1745,8 @@ def int_of_ostype(i, d1, d2):
         else:
             if i == val:
                 exit_key = key
+    if exit_key is None:
+        return None
     for key, val in d2.items():
         if exit_key == key:
             return val

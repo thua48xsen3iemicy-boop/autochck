@@ -27,6 +27,8 @@ CHECK_LABELS = {
     'special': 'Спецпроверки лабы',
     'vlan_membership': 'Распределение по VLAN',
     'vlan_trunks': 'Транки между коммутаторами',
+    'vlan_router_int': 'Маршрутизатор в каждом VLAN',
+    'vlan_unused_ports': 'Отключение неиспользуемых портов',
 }
 
 

@@ -139,6 +139,9 @@ PENALTIES = {
     # Лишний VLAN, фактически назначенный на порт узла из подсказки, —
     # это уже ошибка конфигурации
     'vlan_extra_used': 3,
+    # Выключенный (shutdown) порт коммутатора, ведущий к узлу задания:
+    # vlan может быть настроен верно, но узел отрезан от сети
+    'vlan_port_shutdown': 3,
 }
 
 # Человекочитаемые названия проверок для отчёта вынесены в общий модуль
@@ -1796,6 +1799,19 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
             errs.append(f'L2: на {sw} не выключены неиспользуемые порты: {", ".join(bad)} (нужен shutdown)')
     unused_result = (u_total - u_wrong, u_total) if u_total else None
 
+    # Выключенные порты, ведущие к узлам задания: настройка vlan может быть
+    # верной (show vlan brief показывает и выключенные порты, membership
+    # проходит), но узел фактически отрезан от сети — штраф
+    port_down = 0
+    for member, flist in facing.items():
+        if member_count.get(member, 0) == 0:
+            continue
+        for _tap, sw, pname in flist:
+            st = switch_data.get(sw, {}).get('intstat', {}).get(pname)
+            if st in ('disabled', 'err-disabled'):
+                port_down += 1
+                errs.append(f'L2: порт {pname} на {sw} (узел {member}) выключен ({st}) — узел отрезан от сети')
+
     # Лишние VLAN'ы на коммутаторах — не совпадающие ни с одной группой задания.
     # Просто созданный лишний VLAN — мягкий штраф (vlan_extra); лишний VLAN,
     # назначенный на порт, ведущий к узлу из подсказки, — ошибка конфигурации
@@ -1845,6 +1861,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
     return {'membership': (total - wrong, total), 'trunks': trunks_result,
             'unused': unused_result,
             'extra_vlans': (extra_plain, extra_used),
+            'port_down': port_down,
             'errors': errs, 'debug': debug,
             'groups': groups, 'switches': switches,
             'facing': facing, 'switch_data': switch_data}
@@ -2279,9 +2296,10 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         add_check('vlan_trunks', l2res['trunks'][0], l2res['trunks'][1])
                     if l2res['unused']:
                         add_check('vlan_unused_ports', l2res['unused'][0], l2res['unused'][1])
-                    # Штрафы за лишние VLAN'ы: max не меняют, вычитаются из итога
+                    # Штрафы: max не меняют, вычитаются из итога
                     add_penalty('vlan_extra', l2res['extra_vlans'][0])
                     add_penalty('vlan_extra_used', l2res['extra_vlans'][1])
+                    add_penalty('vlan_port_shutdown', l2res['port_down'])
                 # =============== L2 MULTISWITCH (VLAN) END ===============
 
 

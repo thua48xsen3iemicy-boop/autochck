@@ -31,6 +31,7 @@ CHECK_LABELS = {
     'vlan_unused_ports': 'Отключение неиспользуемых портов',
     'vlan_extra': 'Лишние VLAN',
     'vlan_extra_used': 'Лишний VLAN на порту узла',
+    'vlan_port_shutdown': 'Выключен порт узла',
 }
 
 

@@ -152,6 +152,33 @@ try:
 except ImportError:
     CHECK_LABELS = {}
 
+# Диагностические словари, собранные при проверке, — их сохраняем в debug_json,
+# чтобы сервер отчётов мог показать «собранную информацию» по попытке. Снимок
+# делается ДО pop() (см. финальный return), иначе часть словарей уже удалена.
+# Ключи, которых нет в конкретном прогоне, просто пропускаются.
+COLLECTED_KEYS = [
+    'bridges',
+    'dict_of_vmname_and_uid',
+    'dict_of_intname_and_mac',
+    'dict_of_name_fullcmd',
+    'dict_of_vmnames_hostname',
+    'mikrotik_raw_output',
+    'dict_of_name_routeros_script',
+    'l2_vlans_debug',
+    'l2_domains',
+    'l2_subints',
+    'dict_of_vmnames_defgw',
+    'dict_of_vmnames_dnssrv',
+    'dict_of_intnames_ipaddr',
+    'dict_of_intnames_ipaddr_for_answer',
+    'dict_of_intnames_network',
+    'list_of_routers',
+    'dict_of_bridges_vmnames',
+    'dict_of_routers_address',
+    'list_of_networks',
+    'dict_of_name_winservers_script',
+]
+
 def save_run(run, checks, db_path=RESULT_DB_PATH):
     """Сохраняет один прогон (runs) и разбивку по проверкам (check_items). Возвращает run_id.
 
@@ -3488,6 +3515,8 @@ async def ping(request: Request, fmt: str = Query('auto')):
         forFileResult.update(forwebresult)
         os.remove('/tmp/chk.lock')
 
+        # Снимок собранной диагностики для debug_json — ДО pop() ниже.
+        collected = {k: forFileResult[k] for k in COLLECTED_KEYS if k in forFileResult}
 
         forFileResult.pop('dict_of_name_fullcmd', None)
         forFileResult.pop('dbg', None)
@@ -3538,7 +3567,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 'lab_done': lab_done_flag,
                 'errors_json': json.dumps(errors['errors_noty'], ensure_ascii=False),
                 'errorinfo': answer.get('errorinfo'),
-                'debug_json': json.dumps(forFileResult, ensure_ascii=False),
+                'debug_json': json.dumps(collected, ensure_ascii=False),
                 'penalties_json': json.dumps(penalties, ensure_ascii=False),
             }
             try:

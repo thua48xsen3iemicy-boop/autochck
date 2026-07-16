@@ -217,6 +217,12 @@ def _fetch_runs(conn) -> list:
             r['penalties'] = json.loads(r['penalties_json']) if r.get('penalties_json') else {}
         except (ValueError, TypeError):
             r['penalties'] = {}
+        try:
+            r['collected'] = json.loads(r['debug_json']) if r.get('debug_json') else {}
+        except (ValueError, TypeError):
+            r['collected'] = {}
+        if not isinstance(r['collected'], dict):
+            r['collected'] = {}
     return runs
 
 
@@ -313,6 +319,7 @@ def _attempt_view(a: dict, best_id) -> dict:
         'maxscore': a['max_score'], 'percent': a['percent'], 'grade': a['grade'],
         'done': bool(a['lab_done']), 'items': a['items'],
         'penalties': a['penalties'], 'errors': a['errors'],
+        'collected': a.get('collected', {}),
         'is_best': a['id'] == best_id,
     }
 

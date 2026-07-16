@@ -632,8 +632,15 @@ def find_uuid_in_file_and_ps(file_path):
     with open(file_path, 'r') as file:
         for line in file:
             if 'node' in line:
+                # u/n сбрасываются на каждой ноде: раньше нода без uuid
+                # (IOL) наследовала uuid предыдущей в dict_of_vmname_and_uid
+                u = ''
+                n = ''
+                # IOL-ноды не qemu: их uuid (если вдруг есть) не должен
+                # участвовать в сверке количества с процессами qemu
+                is_iol = 'template="iol"' in line
                 match = re.search(r'\suuid="([a-fA-F0-9\-]+)"\s', line)
-                if match:
+                if match and not is_iol:
                     u = match.group(1)
                     uuids.append(match.group(1))
 
@@ -673,6 +680,92 @@ def find_uuid_in_file_and_ps(file_path):
     else:
         log('Лишние ноды', output)
         return("count", output)
+
+def parse_unl_nodes(lab_file):
+    """Разбирает ноды из файла лабы (.unl):
+    {имя: {'id': int|None, 'template': str, 'image': str,
+           'iface_names': {номер инта: 'e0/0', ...}}}.
+
+    iface_names берутся из дочерних <interface> элементов ноды — для IOL
+    там лежат фактические имена портов (e0/0, e0/1, ...), которые нужны,
+    чтобы сопоставить tap-интерфейсы с выводом show-команд коммутатора.
+    """
+    try:
+        with open(lab_file, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError as e:
+        log('parse_unl_nodes read err', e)
+        return {}
+    nodes = {}
+    for m in re.finditer(r'<node\b([^>]*?)(?:/>|>(.*?)</node>)', content, re.DOTALL):
+        attrs, body = m.group(1), m.group(2) or ''
+        name_m = re.search(r'\sname="([^"]+)"', attrs)
+        if not name_m:
+            continue
+        id_m = re.search(r'\sid="(\d+)"', attrs)
+        tpl_m = re.search(r'\stemplate="([^"]+)"', attrs)
+        img_m = re.search(r'\simage="([^"]+)"', attrs)
+        ifaces = {}
+        for im in re.finditer(r'<interface\b([^>]*?)/?>', body):
+            iattrs = im.group(1)
+            iid = re.search(r'\sid="(\d+)"', iattrs)
+            iname = re.search(r'\sname="([^"]+)"', iattrs)
+            if iid and iname:
+                ifaces[int(iid.group(1))] = iname.group(1)
+        nodes[name_m.group(1)] = {
+            'id': int(id_m.group(1)) if id_m else None,
+            'template': tpl_m.group(1) if tpl_m else '',
+            'image': img_m.group(1) if img_m else '',
+            'iface_names': ifaces,
+        }
+    return nodes
+
+def get_iol_console_ports():
+    """Консольные порты запущенных IOL-нод: {имя ноды: tcp-порт}.
+
+    У IOL нет qemu-процесса с monitor.sock, поэтому порт определяем по
+    самому процессу iol_wrapper: имя ноды — его аргумент -t, порт консоли —
+    слушающий TCP-порт этого процесса (ss -tlnp). Если ss недоступен или
+    порт не нашёлся, используем формулу EVE-NG: 32768 + 128*(-T) + (-D).
+    """
+    try:
+        psout = subprocess.check_output(['ps', 'aux'], universal_newlines=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        log('get_iol_console_ports ps err', e)
+        return {}
+    listen_by_pid = {}
+    try:
+        ssout = subprocess.check_output(['ss', '-tlnp'], universal_newlines=True)
+        for line in ssout.splitlines():
+            pm = re.search(r':(\d+)\s', line)
+            if not pm:
+                continue
+            for pidm in re.finditer(r'pid=(\d+)', line):
+                listen_by_pid.setdefault(int(pidm.group(1)), set()).add(int(pm.group(1)))
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        log('get_iol_console_ports ss err', e)
+    ports = {}
+    for line in psout.splitlines():
+        if 'iol_wrapper' not in line or 'grep' in line:
+            continue
+        parts = line.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            continue
+        pid = int(parts[1])
+        nm = re.search(r'-t\s+(\S+)', line)
+        if not nm:
+            continue
+        name = nm.group(1).strip('"\'')
+        lports = listen_by_pid.get(pid)
+        if lports:
+            ports[name] = min(lports)
+        else:
+            tm = re.search(r'-T\s+(\d+)', line)
+            dm = re.search(r'-D\s+(\d+)', line)
+            if tm and dm:
+                ports[name] = 32768 + 128 * int(tm.group(1)) + int(dm.group(1))
+    log('iol console ports', ports)
+    return ports
 
 def parse_brctl_show():
     try:
@@ -760,8 +853,9 @@ def get_tap_mac_map():
                 tap_mac[ifname] = netid_to_mac[netid].lower()
     return tap_mac
 
-def start_bridge():
+def start_bridge(unl_nodes=None):
 
+    unl_nodes = unl_nodes or {}
     bridges = parse_brctl_show()
     log('bridges:', bridges)
     #print('bridges', bridges)
@@ -772,7 +866,21 @@ def start_bridge():
     list_of_vmnames = []
 
     orphan_ports = []
-    cleaned_bridges = {}
+    cleaned_by_bridge = {}
+    # id ноды -> имя для IOL-нод лабы (у них нет процесса qemu, разбираем отдельно)
+    iol_ids = {d['id']: n for n, d in unl_nodes.items()
+               if d.get('template') == 'iol' and d.get('id') is not None}
+    pending_iol = []      # (мост, порт) — vunl-порты без qemu, кандидаты в IOL
+    resolved_pairs = []   # (имя qemu-ноды, порт) — для обучения привязки IOL
+
+    def register_port(vmname, port):
+        list_of_intname.append(port)
+        list_of_vmid.append(port.split('_')[0])
+        list_of_vmnames.append(vmname)
+        if vmname in dict_of_name_and_intname:
+            dict_of_name_and_intname[vmname] = dict_of_name_and_intname[vmname] + ' ' + port
+        else:
+            dict_of_name_and_intname[vmname] = port
 
     for bridge in bridges:
         cleaned_ports = []
@@ -787,26 +895,78 @@ def start_bridge():
             # get_name_and_path_by_int_id возвращает кортеж (vmname, vmpath) при успехе
             # и строку-ошибку, если живого qemu-процесса для этого tap нет.
             if not isinstance(result, tuple):
-                # У tap-интерфейса нет процесса qemu — осиротевший мост чужой/остановленной лабы
-                orphan_ports.append(port)
+                if iol_ids:
+                    # В лабе есть IOL-ноды — tap может принадлежать одной из них
+                    pending_iol.append((bridge, port))
+                else:
+                    # У tap-интерфейса нет процесса qemu — осиротевший мост чужой/остановленной лабы
+                    orphan_ports.append(port)
                 continue
 
             vmname, vmpath, *_ = result
             cleaned_ports.append(port)
-            list_of_intname.append(port)
-            list_of_vmid.append(vmid[0])
-            list_of_vmnames.append(vmname)
-            if vmname in dict_of_name_and_intname:
-                dict_of_name_and_intname[vmname] = dict_of_name_and_intname[vmname] + ' ' + port
-            else:
-                dict_of_name_and_intname[vmname] = port
+            register_port(vmname, port)
+            resolved_pairs.append((vmname, port))
 
             dict_of_name_and_path[vmname] = vmpath
 
-        # Мост оставляем, только если в нём остались валидные порты.
-        # pnet0 при этом сохраняется автоматически — у него легитимно только eth0.
-        if cleaned_ports:
-            cleaned_bridges[bridge] = cleaned_ports
+        cleaned_by_bridge[bridge] = cleaned_ports
+
+    if pending_iol:
+        # Привязываем vunl-порты без qemu-процесса к IOL-нодам. Их tap'ы
+        # создаёт iol_wrapper, и имени tap'а в командной строке нет, поэтому
+        # используем числовой префикс tap'а (vunl443_2 -> 443): он связан с id
+        # ноды лабы постоянным смещением (base + id). Базу учим по уже
+        # разобранным qemu-нодам той же лабы, а если qemu-нод нет — подбираем
+        # такую, при которой каждый кандидат ложится на id какой-нибудь IOL-ноды.
+        def tapnum(port):
+            m = re.match(r'vunl(\d+)_', port)
+            return int(m.group(1)) if m else None
+
+        base_votes = Counter()
+        for vmname, port in resolved_pairs:
+            nid = unl_nodes.get(vmname, {}).get('id')
+            num = tapnum(port)
+            if nid is not None and num is not None:
+                base_votes[num - nid] += 1
+
+        cand_nums = {tapnum(p) for _b, p in pending_iol}
+        cand_nums.discard(None)
+        chosen_base = None
+        if base_votes:
+            chosen_base = base_votes.most_common(1)[0][0]
+        elif cand_nums:
+            fits = [b for b in sorted({num - nid for num in cand_nums for nid in iol_ids})
+                    if all((num - b) in iol_ids for num in cand_nums)]
+            if len(fits) == 1:
+                chosen_base = fits[0]
+        log('iol tap resolve', f'base_votes={dict(base_votes)} chosen={chosen_base} candidates={sorted(cand_nums)} iol_ids={iol_ids}')
+
+        iol_console_ports = get_iol_console_ports()
+        unresolved = []
+        for bridge, port in pending_iol:
+            num = tapnum(port)
+            vmname = None
+            if num is not None and chosen_base is not None and (num - chosen_base) in iol_ids:
+                vmname = iol_ids[num - chosen_base]
+            elif len(iol_ids) == 1 and len(cand_nums) == 1:
+                # Единственная IOL-нода и один общий префикс tap'ов — её порты
+                vmname = next(iter(iol_ids.values()))
+            if vmname is None:
+                unresolved.append(port)
+                continue
+            cleaned_by_bridge[bridge].append(port)
+            register_port(vmname, port)
+            if vmname not in dict_of_name_and_path and vmname in iol_console_ports:
+                # Маркер iol:<port> — телнет-порт консоли, а не путь к сокету
+                dict_of_name_and_path[vmname] = f'iol:{iol_console_ports[vmname]}'
+        if unresolved:
+            log('iol taps unresolved (treated as orphan)', unresolved)
+            orphan_ports.extend(unresolved)
+
+    # Мост оставляем, только если в нём остались валидные порты.
+    # pnet0 при этом сохраняется автоматически — у него легитимно только eth0.
+    cleaned_bridges = {b: p for b, p in cleaned_by_bridge.items() if p}
 
     removed_bridges = [b for b in bridges if b not in cleaned_bridges]
     if orphan_ports:
@@ -1402,17 +1562,62 @@ async def execute_command_routeros(cmd, port, name):
 ############################################################ ROUTEROS
 
 ############################################################ L2 MULTISWITCH
-# Проверка распределения узлов по VLAN на управляемых коммутаторах (viosl2),
-# в том числе при нескольких свитчах с транками между ними. Самостоятельный
-# блок: свитчи опрашиваются повторно, независимо от основного прохода.
+# Проверка распределения узлов по VLAN на управляемых коммутаторах (viosl2
+# и IOL L2), в том числе при нескольких свитчах с транками между ними.
+# Самостоятельный блок: свитчи опрашиваются повторно, независимо от
+# основного прохода.
 #
 # Подсказка задаётся преподавателем в <description> лабы (.unl) — группы
 # вхождения в VLAN в скобках, опционально с номером VLAN через двоеточие:
 #   (A, B, R) (C,D,R) (E,R)      — проверяется только разбиение
 #   (10: A,B,R) (20: C,D,R)      — дополнительно проверяются сами номера
+# Если подсказки нет, группы выводятся из имён узлов, подключённых к
+# коммутаторам (guess_l2_groups_by_names): mgr1/mgr2, adm1..adm3, buh1 ->
+# группы mgr, adm, buh; роутер (R, R1, router2) добавляется в каждую группу.
 # Узел, входящий в несколько групп (роутер), может сидеть на trunk-порту.
 # STP/VTP/native vlan сознательно не проверяются: топологии без избыточных
 # связей.
+
+# Роутер по имени: R, R1, router, Router2, r-1 и т.п. (регистр не важен)
+ROUTER_NAME_RE = re.compile(r'^(?:r|router)[-_]?\d*$', re.IGNORECASE)
+
+def guess_l2_groups_by_names(node_names):
+    """Fallback, когда в описании лабы нет подсказки: группы VLAN по префиксам
+    имён узлов, подключённых к коммутаторам.
+
+    Префикс — имя в нижнем регистре без хвостовых цифр и разделителей -/_:
+    mgr1, mgr2 -> mgr; pc-adm-1 -> pc-adm; admin (без цифр) — сам себе
+    префикс, поэтому adm1..adm3 и admin — РАЗНЫЕ группы. Роутеры (по
+    ROUTER_NAME_RE) не образуют групп, а добавляются участником в каждую.
+    Меньше двух групп — делить нечего (это не VLAN-лаба), возвращаем [].
+    """
+    routers = sorted(n for n in node_names if ROUTER_NAME_RE.match(n.strip()))
+    by_prefix = {}
+    for name in sorted(node_names):
+        if name in routers:
+            continue
+        prefix = re.sub(r'\d+$', '', name.strip().lower()).rstrip('-_')
+        if not prefix:
+            continue
+        by_prefix.setdefault(prefix, []).append(name)
+    if len(by_prefix) < 2:
+        return []
+    return [{'vlan': None, 'members': members + routers}
+            for _prefix, members in sorted(by_prefix.items())]
+
+def l2_switch_names(dict_of_name_and_ostype, unl_nodes):
+    """Имена управляемых коммутаторов лабы: vIOS-L2 всегда; IOL — если образ
+    похож на L2 (или образ в лабе не указан: тогда лучше попробовать
+    опросить, чем молча пропустить). IOL L3-роутеры отсекаются по image."""
+    switches = []
+    for name, t in dict_of_name_and_ostype.items():
+        if t == 'viosl2':
+            switches.append(name)
+        elif t == 'iol':
+            image = (unl_nodes.get(name) or {}).get('image', '')
+            if not image or 'l2' in image.lower():
+                switches.append(name)
+    return switches
 
 def parse_l2_hint(lab_file):
     """Читает L2-подсказку из <description> файла лабы.
@@ -1513,7 +1718,7 @@ def parse_int_status(lines):
             statuses[parts[0]] = status
     return statuses
 
-def build_switch_links(switch_names, dict_of_name_and_intname, bridges):
+def build_switch_links(switch_names, dict_of_name_and_intname, bridges, iol_iface_names=None):
     """Схема подключений по линукс-бриджам (tap vunlX_N <-> сосед по бриджу).
 
     Возвращает:
@@ -1522,8 +1727,11 @@ def build_switch_links(switch_names, dict_of_name_and_intname, bridges):
       facing:   {узел: [(его tap, свитч, порт свитча)]} — точки подключения
                 не-свитчевых узлов к свитчам
     Номер интерфейса N из имени tap переводится в имя порта vIOS-L2
-    (4 порта на модуль): N=5 -> Gi1/1.
+    (4 порта на модуль): N=5 -> Gi1/1. Для IOL-свитчей (iol_iface_names =
+    {свитч: {N: 'e0/0'}}) имя порта берётся из лабы и приводится к виду
+    show-команд ('Et0/0'); если в лабе имени нет — Et{N//4}/{N%4}.
     """
+    iol_iface_names = iol_iface_names or {}
     tap_owner = {}
     for vmname, taps in dict_of_name_and_intname.items():
         for tap in taps:
@@ -1531,6 +1739,13 @@ def build_switch_links(switch_names, dict_of_name_and_intname, bridges):
 
     def portname(tap):
         n = int(tap.split('_')[1])
+        if tap_owner.get(tap) in iol_iface_names:
+            raw = iol_iface_names[tap_owner[tap]].get(n)
+            if raw:
+                m = re.match(r'^[A-Za-z]+(\d+/\d+)$', raw.strip())
+                if m:
+                    return 'Et' + m.group(1)
+            return f'Et{n // 4}/{n % 4}'
         return f'Gi{n // 4}/{n % 4}'
 
     links = {sw: {} for sw in switch_names}
@@ -1646,22 +1861,39 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
 async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_intname, dict_of_name_and_path, bridges):
     """Проверка L2: распределение узлов по VLAN и транки между коммутаторами.
 
-    Возвращает None, если в лабе нет подсказки или нет свитчей, иначе dict:
+    Возвращает None, если нет свитчей либо не удалось получить группы (нет
+    подсказки в описании и по именам узлов их не вывести), иначе dict:
       {'membership': (score, max), 'trunks': (score, max) или None,
        'errors': [сообщения для отчёта], 'debug': {...}}
     """
+    unl_nodes = parse_unl_nodes(lab_file)
+    switches = l2_switch_names(dict_of_name_and_ostype, unl_nodes)
+    if not switches:
+        return None
+
+    # Имена портов IOL-свитчей — из лабы (для сопоставления с show-командами)
+    iol_iface_names = {sw: (unl_nodes.get(sw) or {}).get('iface_names', {})
+                       for sw in switches
+                       if (unl_nodes.get(sw) or {}).get('template') == 'iol'}
+    links, sw_links, facing = build_switch_links(switches, dict_of_name_and_intname,
+                                                 bridges, iol_iface_names)
+
+    known = set(dict_of_name_and_ostype)
     groups = parse_l2_hint(lab_file)
-    switches = [n for n, t in dict_of_name_and_ostype.items() if t == 'viosl2']
-    if not groups or not switches:
+    # Скобки из обычного текста описания (ни одного известного имени) — не подсказка
+    groups = [g for g in groups if any(m in known for m in g['members'])]
+    groups_source = 'hint'
+    if not groups:
+        # Подсказки нет — пробуем вывести группы из имён узлов, подключённых
+        # к коммутаторам (mgr1/mgr2, adm1..adm3, ... + роутер в каждую)
+        groups = guess_l2_groups_by_names(set(facing))
+        groups_source = 'names'
+        if groups:
+            log('l2 groups guessed by names', groups)
+    if not groups:
         return None
 
     errs = []
-    known = set(dict_of_name_and_ostype)
-
-    # Скобки из обычного текста описания (ни одного известного имени) — не подсказка
-    groups = [g for g in groups if any(m in known for m in g['members'])]
-    if not groups:
-        return None
 
     # Повторный опрос свитчей, независимый от основного прохода
     tasks = []
@@ -1670,7 +1902,11 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         if not path:
             errs.append(f'L2: у коммутатора {name} не найден путь к консоли')
             continue
-        port = int(path.split('/')[1]) + 30000
+        if path.startswith('iol:'):
+            # IOL: в path лежит сразу телнет-порт консоли (см. start_bridge)
+            port = int(path.split(':', 1)[1])
+        else:
+            port = int(path.split('/')[1]) + 30000
         handler = pexpect.spawnu(f'telnet 127.0.0.1 {port}', maxread=100000)
         tasks.append(asyncio.ensure_future(execute_command_cisco(handler, name)))
     switch_data = {}
@@ -1693,8 +1929,6 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         else:
             errs.append(f'L2: не удалось опросить коммутатор {name}')
             switch_hostnames[name] = 'NONE'
-
-    links, sw_links, facing = build_switch_links(switches, dict_of_name_and_intname, bridges)
 
     # Порты свитчей, за которыми сидит каждый не-свитчевый узел
     node_ports = {}
@@ -1861,6 +2095,9 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
 
     debug = {
         'groups': [{'vlan': g['vlan'], 'members': g['members']} for g in groups],
+        # 'hint' — из <description> лабы, 'names' — выведены по именам узлов
+        'groups_source': groups_source,
+        'iol_switches': sorted(iol_iface_names),
         'links': links,
         'sw_links': sw_links,
         'switch_vlans': {sw: {str(vid): sorted(p) for vid, p in d['vlans'].items()} for sw, d in switch_data.items()},
@@ -2085,7 +2322,10 @@ async def ping(request: Request, fmt: str = Query('auto')):
             dict_of_name_and_ostype, dict_of_vmname_and_uid = find_uuid_in_file_and_ps(lab_path)
             if dict_of_name_and_ostype != 'count' and dict_of_name_and_ostype != 'multilab':
                 answer['name_ostype'] = str(dict_of_name_and_ostype)
-                dict_of_name_and_path, list_of_vmnames, list_of_intname, dict_of_name_and_intname, bridges = start_bridge()
+                # Данные нод из .unl нужны start_bridge, чтобы привязать
+                # tap'ы IOL-нод (у них нет процесса qemu)
+                unl_nodes = parse_unl_nodes(lab_path)
+                dict_of_name_and_path, list_of_vmnames, list_of_intname, dict_of_name_and_intname, bridges = start_bridge(unl_nodes)
                 answer['list_of_vmnames'] = str(list_of_vmnames)
                 answer['list_of_intname'] = str(list_of_intname)
                 answer['dict_of_name_and_intname'] = str(dict_of_name_and_intname)
@@ -2179,9 +2419,9 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         dict_of_vmnames_hostname[name] = dict_of_name_fullcmd[name]['HOSTNAME'][0]
                 answer['dict_of_vmnames_hostname'] = dict_of_vmnames_hostname
 
-                # Коммутаторы (viosl2) здесь больше не опрашиваются: их целиком
-                # опрашивает L2-блок (check_l2_vlans), иначе каждый свитч
-                # дёргался по консоли дважды за прогон
+                # Коммутаторы (viosl2, IOL L2) здесь больше не опрашиваются:
+                # их целиком опрашивает L2-блок (check_l2_vlans), иначе каждый
+                # свитч дёргался по консоли дважды за прогон
                 for name in list_of_vmnames:
                     if dict_of_name_and_ostype[name] == 'mikrotik':
                         tmpport = dict_of_name_and_path[name]
@@ -2689,7 +2929,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         for intname in bridges[bridge]:
                             int_ostype = int_of_ostype(intname, dict_of_name_and_intname, dict_of_name_and_ostype)
                             # if int_ostype != 'viosl2' and dict_of_intnames_ipaddr[intname] != 'NONE' and dict_of_intnames_ipaddr[intname] != 'MULTI' and dict_of_intnames_ipaddr[intname] != 'DOWN':
-                            if int_ostype != 'viosl2' and intname in dict_of_intnames_ipaddr and dict_of_intnames_ipaddr[intname] != 'NONE' and dict_of_intnames_ipaddr[intname] != 'MULTI' and dict_of_intnames_ipaddr[intname] != 'DOWN':
+                            if int_ostype not in ('viosl2', 'iol') and intname in dict_of_intnames_ipaddr and dict_of_intnames_ipaddr[intname] != 'NONE' and dict_of_intnames_ipaddr[intname] != 'MULTI' and dict_of_intnames_ipaddr[intname] != 'DOWN':
                                 nets_to_check.append(dict_of_intnames_ipaddr[intname])
                                 intnames_list.append(intname)
                         if nets_to_check:

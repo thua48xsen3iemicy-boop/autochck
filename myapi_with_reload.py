@@ -1953,7 +1953,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
     # enable-пароль из описания лабы (cisco_pass:...); None — дефолтный cissecret
     cisco_secret = parse_cisco_pass(lab_file)
     if cisco_secret is not None:
-        log('l2 cisco enable password from description hint')
+        log('l2 cisco enable password from description hint', 'set')
 
     # Повторный опрос свитчей, независимый от основного прохода
     tasks = []

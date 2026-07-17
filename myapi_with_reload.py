@@ -2625,30 +2625,33 @@ async def ping(request: Request, fmt: str = Query('auto')):
                             for int_name_router in dict_routeros_ints_bymac.keys():
                                 mtk_set_addr(int_name_router, dict_routeros_ints_bymac[int_name_router])
 
-                            # === L2 MULTISWITCH: зеркало linux-ветки. Каждый vlan
-                            # регистрируется виртуальным интом 'tap.vlanid' со своим
-                            # адресом — дальше базовые проверки (адреса, сети,
-                            # шлюзы, дубли) работают с ним как с обычным.
+                            # vlan-сабинтерфейсы регистрируем виртуальным интом
+                            # 'tap.vlanid' со своим адресом — базовые проверки
+                            # (адреса, сети, шлюзы, дубли) работают с ним как с
+                            # обычным. В отличие от linux-ветки не зависим от
+                            # l2res: у RouterOS /export даёт vlan-id и адрес
+                            # явно, угадывать нечего. dict_of_subints нужен
+                            # build_l2_domains'у — он всё равно отработает только
+                            # при активном l2res.
                             tracked_ints = len(dict_routeros_ints_bymac)
-                            if l2res:
-                                for intname, guest_if in dict_routeros_ints_bymac.items():
-                                    has_subints = False
-                                    for vparent, vname, vid in mtk_vlan_subints:
-                                        if vparent != guest_if:
-                                            continue
-                                        has_subints = True
-                                        virt = f'{intname}.{vid}'
-                                        dict_of_name_and_intname[routeros_result[0]].append(virt)
-                                        dict_of_subints.setdefault(intname, {})[vid] = virt
-                                        mtk_set_addr(virt, vname)
-                                        tracked_ints += 1
-                                    if has_subints and dict_of_intnames_ipaddr.get(intname) == 'NONE':
-                                        # Физический родитель без адреса — норма для
-                                        # роутера-на-палочке, не штрафуем его как
-                                        # безадресный
-                                        dict_of_name_and_intname[routeros_result[0]].remove(intname)
-                                        dict_of_intnames_ipaddr.pop(intname, None)
-                                        tracked_ints -= 1
+                            for intname, guest_if in list(dict_routeros_ints_bymac.items()):
+                                has_subints = False
+                                for vparent, vname, vid in mtk_vlan_subints:
+                                    if vparent != guest_if:
+                                        continue
+                                    has_subints = True
+                                    virt = f'{intname}.{vid}'
+                                    dict_of_name_and_intname[routeros_result[0]].append(virt)
+                                    dict_of_subints.setdefault(intname, {})[vid] = virt
+                                    mtk_set_addr(virt, vname)
+                                    tracked_ints += 1
+                                if has_subints and dict_of_intnames_ipaddr.get(intname) == 'NONE':
+                                    # Физический родитель без адреса — норма для
+                                    # роутера-на-палочке, не штрафуем его как
+                                    # безадресный
+                                    dict_of_name_and_intname[routeros_result[0]].remove(intname)
+                                    dict_of_intnames_ipaddr.pop(intname, None)
+                                    tracked_ints -= 1
                             # Раньше в подсчёт попадала пустая строка-хвост секции,
                             # а адреса vlan-сабинтерфейсов не учитывались вовсе
                             if len(mtk_addr_lines) != tracked_ints:

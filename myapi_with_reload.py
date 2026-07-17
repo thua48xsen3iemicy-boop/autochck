@@ -2494,6 +2494,37 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 ipresult = await asyncio.gather(*iptasks)
                 routeros_results = await asyncio.gather(*routeros_tmps)
                 answer['mikrotik_raw_output'] = routeros_results
+
+                # =============== L2 MULTISWITCH (VLAN) ===============
+                # Единственное место опроса коммутаторов; подсказка берётся из
+                # <description> лабы. Ошибка внутри блока не роняет остальную
+                # проверку. Выполняется до разбора RouterOS: mikrotik-ветке
+                # нужен l2res, чтобы зарегистрировать vlan-сабинтерфейсы.
+                try:
+                    l2res = await check_l2_vlans(lab_path, dict_of_name_and_ostype,
+                                                 dict_of_name_and_intname,
+                                                 dict_of_name_and_path, bridges)
+                except Exception:
+                    l2res = None
+                    log('check_l2_vlans err', traceback.format_exc())
+                if l2res:
+                    answer['l2_vlans_debug'] = l2res['debug']
+                    errors['errors_noty'].extend(l2res['errors'])
+                    add_check('vlan_membership', l2res['membership'][0], l2res['membership'][1])
+                    if l2res['trunks']:
+                        add_check('vlan_trunks', l2res['trunks'][0], l2res['trunks'][1])
+                    if l2res['unused']:
+                        add_check('vlan_unused_ports', l2res['unused'][0], l2res['unused'][1])
+                    # Штрафы: max не меняют, вычитаются из итога
+                    add_penalty('vlan_extra', l2res['extra_vlans'][0])
+                    add_penalty('vlan_extra_used', l2res['extra_vlans'][1])
+                    add_penalty('vlan_port_shutdown', l2res['port_down'])
+                    # Хостнеймы свитчей — в общую проверку "Имена узлов"
+                    dict_of_vmnames_hostname.update(l2res['hostnames'])
+                # =============== L2 MULTISWITCH (VLAN) END ===============
+
+                dict_of_subints = {}
+
                 for routeros_result in routeros_results:
                     list_router_script_out = []
                     for outline in routeros_result[1].splitlines():
@@ -2531,6 +2562,11 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         for line in dict_of_name_routeros_script[routeros_result[0]]['INTERFACE']:
                             if mac_address_pattern.search(line.strip()):
                                 columns = line.split()
+                                # vlan-сабинтерфейсы наследуют MAC родителя и
+                                # затирали бы его в карте — берём только
+                                # физические порты (столбец типа == ether)
+                                if 'ether' not in columns:
+                                    continue
                                 if mac_address_pattern.search(columns[5]):
                                     macaddr_sample = columns[5].split(':')[5]
                                     log_and_print(f'macaddrsample_____________{macaddr_sample}, columns: {columns}')
@@ -2545,7 +2581,9 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                         mikrot_err_macaddr = 1
                         for intname in dict_of_name_and_intname[routeros_result[0]]:
                             int_number = intname.split('_')[1]
-                            for key in dict_routeros_ints_bymac.keys():
+                            # снапшот ключей: pop+add внутри итерации по живому
+                            # keys() — RuntimeError на Python 3.8+
+                            for key in list(dict_routeros_ints_bymac.keys()):
                                 if key == int(int_number):
                                     dict_routeros_ints_bymac[intname] = dict_routeros_ints_bymac.pop(key)
                         unused_ports = []
@@ -2554,26 +2592,67 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                 unused_ports.append(tmpintname)
                         for tmpintname in unused_ports:
                             dict_routeros_ints_bymac.pop(tmpintname)
+                        # vlan-сабинтерфейсы из /export (секция "/interface vlan",
+                        # строки "add interface=LAN name=vlan10 vlan-id=10"):
+                        # в /interface print их не отличить от родителя по MAC
+                        mtk_vlan_subints = []
+                        in_vlan_export = False
+                        for line in dict_of_name_routeros_script[routeros_result[0]]['EXPORT']:
+                            if line.startswith('/'):
+                                in_vlan_export = line.strip() == '/interface vlan'
+                            elif in_vlan_export and line.startswith('add '):
+                                opts = dict(re.findall(r'([\w-]+)=(\S+)', line))
+                                if 'interface' in opts and 'name' in opts and opts.get('vlan-id', '').isdigit():
+                                    mtk_vlan_subints.append((opts['interface'], opts['name'], int(opts['vlan-id'])))
                         if dict_routeros_ints_bymac:
-                            routeros_conf_addaddr = ''
                             answer['dict_routeros_ints_bymac'] = str(dict_routeros_ints_bymac)
-                            if len(dict_of_name_routeros_script[routeros_result[0]]['IPADDR']) != len(dict_routeros_ints_bymac):
+                            # Непустые строки /ip address print; интерфейс — всегда
+                            # последний столбец, сравниваем столбец целиком:
+                            # подстрочный поиск путал vlan1 с vlan10
+                            mtk_addr_lines = [l for l in dict_of_name_routeros_script[routeros_result[0]]['IPADDR'] if l.strip()]
+
+                            def mtk_set_addr(key, ifname):
+                                addr_lines = [l for l in mtk_addr_lines if l.split()[-1] == ifname]
+                                if len(addr_lines) == 1:
+                                    parts = addr_lines[0].split()
+                                    dict_of_intnames_ipaddr[key] = parts[2] if len(parts) == 5 else parts[1]
+                                    dict_of_intnames_realaddr[key] = dict_of_intnames_ipaddr[key]
+                                elif not addr_lines:
+                                    dict_of_intnames_ipaddr[key] = "NONE"
+                                else:
+                                    dict_of_intnames_ipaddr[key] = "MULTI"
+
+                            for int_name_router in dict_routeros_ints_bymac.keys():
+                                mtk_set_addr(int_name_router, dict_routeros_ints_bymac[int_name_router])
+
+                            # === L2 MULTISWITCH: зеркало linux-ветки. Каждый vlan
+                            # регистрируется виртуальным интом 'tap.vlanid' со своим
+                            # адресом — дальше базовые проверки (адреса, сети,
+                            # шлюзы, дубли) работают с ним как с обычным.
+                            tracked_ints = len(dict_routeros_ints_bymac)
+                            if l2res:
+                                for intname, guest_if in dict_routeros_ints_bymac.items():
+                                    has_subints = False
+                                    for vparent, vname, vid in mtk_vlan_subints:
+                                        if vparent != guest_if:
+                                            continue
+                                        has_subints = True
+                                        virt = f'{intname}.{vid}'
+                                        dict_of_name_and_intname[routeros_result[0]].append(virt)
+                                        dict_of_subints.setdefault(intname, {})[vid] = virt
+                                        mtk_set_addr(virt, vname)
+                                        tracked_ints += 1
+                                    if has_subints and dict_of_intnames_ipaddr.get(intname) == 'NONE':
+                                        # Физический родитель без адреса — норма для
+                                        # роутера-на-палочке, не штрафуем его как
+                                        # безадресный
+                                        dict_of_name_and_intname[routeros_result[0]].remove(intname)
+                                        dict_of_intnames_ipaddr.pop(intname, None)
+                                        tracked_ints -= 1
+                            # Раньше в подсчёт попадала пустая строка-хвост секции,
+                            # а адреса vlan-сабинтерфейсов не учитывались вовсе
+                            if len(mtk_addr_lines) != tracked_ints:
                                 errors['errors_noty'].append(f'Проблемы на {routeros_result[0]}, количество ip адресов не равно колву интов')
-                            
-                            for int_name_router in  dict_routeros_ints_bymac.keys():
-                                count = sum(dict_routeros_ints_bymac[int_name_router] in s for s in dict_of_name_routeros_script[routeros_result[0]]['IPADDR'])
-                                if count == 1:
-                                    for addr_line in dict_of_name_routeros_script[routeros_result[0]]['IPADDR']:
-                                        if dict_routeros_ints_bymac[int_name_router] in addr_line:
-                                            if len(addr_line.split()) == 5:
-                                                dict_of_intnames_ipaddr[int_name_router] = addr_line.split()[2]
-                                            else:
-                                                dict_of_intnames_ipaddr[int_name_router] = addr_line.split()[1]
-                                            dict_of_intnames_realaddr[int_name_router] = dict_of_intnames_ipaddr[int_name_router]
-                                elif count == 0:
-                                    dict_of_intnames_ipaddr[int_name_router] = "NONE"
-                                elif count > 1:
-                                    dict_of_intnames_ipaddr[int_name_router] = "MULTI"
                     else:
                         # Заполняем секции пустыми списками: дальше по коду они
                         # индексируются напрямую (DEFGW, DNS, FWNAT, IPROUTE)
@@ -2588,34 +2667,6 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 answer['dict_of_vmnames_hostname'] = dict_of_vmnames_hostname
                 answer['dict_of_name_routeros_script'] = dict_of_name_routeros_script
 
-                # =============== L2 MULTISWITCH (VLAN) ===============
-                # Единственное место опроса коммутаторов; подсказка берётся из
-                # <description> лабы. Ошибка внутри блока не роняет остальную
-                # проверку.
-                try:
-                    l2res = await check_l2_vlans(lab_path, dict_of_name_and_ostype,
-                                                 dict_of_name_and_intname,
-                                                 dict_of_name_and_path, bridges)
-                except Exception:
-                    l2res = None
-                    log('check_l2_vlans err', traceback.format_exc())
-                if l2res:
-                    answer['l2_vlans_debug'] = l2res['debug']
-                    errors['errors_noty'].extend(l2res['errors'])
-                    add_check('vlan_membership', l2res['membership'][0], l2res['membership'][1])
-                    if l2res['trunks']:
-                        add_check('vlan_trunks', l2res['trunks'][0], l2res['trunks'][1])
-                    if l2res['unused']:
-                        add_check('vlan_unused_ports', l2res['unused'][0], l2res['unused'][1])
-                    # Штрафы: max не меняют, вычитаются из итога
-                    add_penalty('vlan_extra', l2res['extra_vlans'][0])
-                    add_penalty('vlan_extra_used', l2res['extra_vlans'][1])
-                    add_penalty('vlan_port_shutdown', l2res['port_down'])
-                    # Хостнеймы свитчей — в общую проверку "Имена узлов"
-                    dict_of_vmnames_hostname.update(l2res['hostnames'])
-                # =============== L2 MULTISWITCH (VLAN) END ===============
-
-
                 # Заголовок интерфейса из `ip -d a`: имя может содержать точку
                 # (ens3.10), у сабинтерфейса после имени идёт @родитель
                 interface_pattern = r'^\d+: ([^:@\s]+)(?:@(\S+))?:'
@@ -2625,8 +2676,6 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 # независимо от нейминга (ens3.10, vlan10, произвольное имя)
                 vlanid_pattern = r'vlan protocol 802\.1Q id (\d+)'
                 ipv4_pattern = r'inet (\d+\.\d+\.\d+\.\d+)/(\d+)'
-
-                dict_of_subints = {}
 
                 for name in list_of_vmnames:
                     if dict_of_name_and_ostype[name] == 'linux':

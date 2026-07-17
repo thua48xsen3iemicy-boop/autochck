@@ -1702,6 +1702,26 @@ def parse_cisco_pass(lab_file):
         return pm.group(1)
     return None
 
+def parse_trunk_prune(lab_file):
+    """Маркер trunk_prune:on в <description> лабы включает проверку прунинга
+    транков: на межкоммутаторном транке разрешены (allowed) только те VLAN,
+    что реально должны через него проходить.
+
+    Возвращает True только при явном on/yes/1/true (регистр не важен); иначе
+    False — старые лабы без маркера проверку не получают.
+    """
+    try:
+        with open(lab_file, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError as e:
+        log('parse_trunk_prune read err', e)
+        return False
+    m = re.search(r'<description>(.*?)</description>', content, re.DOTALL)
+    if not m:
+        return False
+    pm = re.search(r'trunk_prune\s*:\s*(\S+)', m.group(1), re.IGNORECASE)
+    return bool(pm and pm.group(1).lower() in ('on', 'yes', '1', 'true'))
+
 def parse_vlan_list(text):
     """'1,10,20-22' -> {1, 10, 20, 21, 22}; 'none' -> пустое множество."""
     vlans = set()
@@ -1913,6 +1933,28 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
     router_int_result = (r_total - r_wrong, r_total) if r_total else None
     return new_bridges, errs, router_int_result
 
+def switches_reachable_without(sw_links, start, skip_idx):
+    """Множество коммутаторов, достижимых от start по sw_links без линка skip_idx.
+
+    Топология — дерево, поэтому удаление одного линка делит свитчи на две
+    непересекающиеся стороны; функция возвращает ту, где лежит start.
+    """
+    adj = {}
+    for i, (a, _pa, b, _pb) in enumerate(sw_links):
+        if i == skip_idx:
+            continue
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    seen = {start}
+    stack = [start]
+    while stack:
+        n = stack.pop()
+        for m in adj.get(n, ()):
+            if m not in seen:
+                seen.add(m)
+                stack.append(m)
+    return seen
+
 async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_intname, dict_of_name_and_path, bridges):
     """Проверка L2: распределение узлов по VLAN и транки между коммутаторами.
 
@@ -1954,6 +1996,11 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
     cisco_secret = parse_cisco_pass(lab_file)
     if cisco_secret is not None:
         log('l2 cisco enable password from description hint', 'set')
+
+    # Проверка прунинга транков включается маркером trunk_prune:on в описании
+    trunk_prune = parse_trunk_prune(lab_file)
+    if trunk_prune:
+        log('l2 trunk prune check enabled', 'trunk_prune:on')
 
     # Повторный опрос свитчей, независимый от основного прохода
     tasks = []
@@ -2085,6 +2132,45 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         if t_total:
             trunks_result = (t_total - t_wrong, t_total)
 
+    # Прунинг транков (только при маркере trunk_prune:on). На межкоммутаторном
+    # транке в allowed-списке должны быть только те VLAN группы, чьи участники
+    # есть по обе стороны линка. Топология — дерево: убираем линк, делим свитчи
+    # на две стороны; VLAN нужен на линке, если hosts группы есть и там, и там.
+    # Смотрим блок "allowed and active", поэтому лишними считаем VLAN, реально
+    # созданные на свитче (несуществующие в allowed трафика тут не несут).
+    # Router-on-a-stick сюда не попадает: его транк не входит в sw_links.
+    prune_result = None
+    if trunk_prune and len(switches) > 1 and sw_links:
+        expected_vlans_p = {g['vlan'] for g in groups if g['vlan']}
+        group_hosts = []
+        for g in groups:
+            if not g['vlan']:
+                continue
+            hs = set()
+            for member in g['members']:
+                for sw, _pname in node_ports.get(member, []):
+                    hs.add(sw)
+            group_hosts.append((g['vlan'], hs))
+        surplus_by_sw = {}
+        for idx, (sw1, p1, sw2, p2) in enumerate(sw_links):
+            side = switches_reachable_without(sw_links, sw1, idx)
+            needed = {vid for vid, hs in group_hosts if hs & side and hs - side}
+            for sw, port in ((sw1, p1), (sw2, p2)):
+                allowed = switch_data.get(sw, {}).get('trunks', {}).get(port, set())
+                surplus = sorted(v for v in (allowed & expected_vlans_p) - needed
+                                 if v != 1 and not 1002 <= v <= 1005)
+                if surplus:
+                    surplus_by_sw.setdefault(sw, {})[port] = surplus
+        trunk_switches = {l[0] for l in sw_links} | {l[2] for l in sw_links}
+        p_total = len(trunk_switches & set(switches))
+        p_wrong = len(surplus_by_sw)
+        for sw in sorted(surplus_by_sw):
+            for port in sorted(surplus_by_sw[sw]):
+                vids = ", ".join(str(v) for v in surplus_by_sw[sw][port])
+                errs.append(f'L2: на {sw} транк {port} разрешает лишние VLAN {vids} — сузьте allowed vlan до реально необходимых')
+        if p_total:
+            prune_result = (p_total - p_wrong, p_total)
+
     # Незадействованные порты коммутаторов должны быть выключены (shutdown).
     # Считаем по свитчу (один элемент = "на свитче все лишние порты погашены"),
     # чтобы полтора десятка портов не задавили весь остальной счёт.
@@ -2166,7 +2252,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
     # groups/switches/facing/switch_data нужны шагу подмены L1 -> L2
     # (build_l2_domains) после разбора адресов
     return {'membership': (total - wrong, total), 'trunks': trunks_result,
-            'unused': unused_result,
+            'unused': unused_result, 'trunk_prune': prune_result,
             'extra_vlans': (extra_plain, extra_used),
             'port_down': port_down,
             'hostnames': switch_hostnames,
@@ -2515,6 +2601,8 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         add_check('vlan_trunks', l2res['trunks'][0], l2res['trunks'][1])
                     if l2res['unused']:
                         add_check('vlan_unused_ports', l2res['unused'][0], l2res['unused'][1])
+                    if l2res.get('trunk_prune'):
+                        add_check('vlan_trunk_prune', l2res['trunk_prune'][0], l2res['trunk_prune'][1])
                     # Штрафы: max не меняют, вычитаются из итога
                     add_penalty('vlan_extra', l2res['extra_vlans'][0])
                     add_penalty('vlan_extra_used', l2res['extra_vlans'][1])

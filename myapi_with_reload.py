@@ -1722,6 +1722,26 @@ def parse_trunk_prune(lab_file):
     pm = re.search(r'trunk_prune\s*:\s*(\S+)', m.group(1), re.IGNORECASE)
     return bool(pm and pm.group(1).lower() in ('on', 'yes', '1', 'true'))
 
+def parse_mgr_vlan(lab_file):
+    """Номер менеджмент-VLAN из маркера mgr_vlan:<N> в <description> лабы.
+
+    Менеджмент-VLAN легитимен (SVI управления коммутаторами, должен ходить по
+    транкам), поэтому не штрафуется как лишний (vlan_extra) и не считается
+    лишним в allowed-списке транка при проверке прунинга. Возвращает int либо
+    None, если маркера нет.
+    """
+    try:
+        with open(lab_file, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError as e:
+        log('parse_mgr_vlan read err', e)
+        return None
+    m = re.search(r'<description>(.*?)</description>', content, re.DOTALL)
+    if not m:
+        return None
+    pm = re.search(r'mgr_vlan\s*:\s*(\d+)', m.group(1), re.IGNORECASE)
+    return int(pm.group(1)) if pm else None
+
 def parse_vlan_list(text):
     """'1,10,20-22' -> {1, 10, 20, 21, 22}; 'none' -> пустое множество."""
     vlans = set()
@@ -2002,6 +2022,12 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
     if trunk_prune:
         log('l2 trunk prune check enabled', 'trunk_prune:on')
 
+    # Менеджмент-VLAN (mgr_vlan:<N>) не штрафуется как лишний и не считается
+    # лишним в allowed-списке транков
+    mgr_vlan = parse_mgr_vlan(lab_file)
+    if mgr_vlan:
+        log('l2 management vlan from description hint', mgr_vlan)
+
     # Повторный опрос свитчей, независимый от основного прохода
     tasks = []
     for name in switches:
@@ -2158,7 +2184,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
             for sw, port in ((sw1, p1), (sw2, p2)):
                 allowed = switch_data.get(sw, {}).get('trunks', {}).get(port, set())
                 surplus = sorted(v for v in (allowed & expected_vlans_p) - needed
-                                 if v != 1 and not 1002 <= v <= 1005)
+                                 if v != 1 and v != mgr_vlan and not 1002 <= v <= 1005)
                 if surplus:
                     surplus_by_sw.setdefault(sw, {})[port] = surplus
         trunk_switches = {l[0] for l in sw_links} | {l[2] for l in sw_links}
@@ -2217,7 +2243,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         member_ports = {p for p, peers in links.get(sw, {}).items()
                         if any(peer in hinted_nodes for peer in peers)}
         for vid, vports in sorted(data['vlans'].items()):
-            if vid == 1 or 1002 <= vid <= 1005 or vid in expected_vlans:
+            if vid == 1 or 1002 <= vid <= 1005 or vid in expected_vlans or vid == mgr_vlan:
                 continue
             used = sorted(vports & member_ports)
             if used:

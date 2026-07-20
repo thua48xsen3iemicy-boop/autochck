@@ -1813,25 +1813,27 @@ def parse_int_status(lines):
             statuses[parts[0]] = status
     return statuses
 
-def parse_ip_int_svi(lines):
-    """Секция IPINT (show ip interface) -> {vlan_id: 'ip/prefix'} для SVI.
+def parse_ip_int(lines):
+    """Секция IPINT (show ip interface) -> {интерфейс: ['ip/prefix', ...]}.
 
-    Берём только интерфейсы вида VlanN с настроенным адресом (строка
-    "Internet address is A.B.C.D/xx"). Интерфейсы без адреса пропускаются.
+    По каждому интерфейсу собираем все адреса в порядке вывода: первый —
+    основной ("Internet address is A.B.C.D/xx"), последующие — вторичные
+    ("Secondary address ..."). Строки без CIDR (broadcast и т.п.) не
+    матчатся, т.к. в них нет '/<prefix>'. Интерфейсы без адреса опускаются.
     """
-    svi = {}
+    res = {}
     cur = None
     for line in lines:
         m = re.match(r'^(\S+) is ', line)
         if m:
             cur = m.group(1)
             continue
-        am = re.search(r'Internet address is (\d+\.\d+\.\d+\.\d+/\d+)', line)
-        if am and cur:
-            vm = re.match(r'(?i)vlan(\d+)$', cur)
-            if vm:
-                svi[int(vm.group(1))] = am.group(1)
-    return svi
+        if not cur:
+            continue
+        am = re.search(r'(\d+\.\d+\.\d+\.\d+/\d+)', line)
+        if am:
+            res.setdefault(cur, []).append(am.group(1))
+    return res
 
 def build_switch_links(switch_names, dict_of_name_and_intname, bridges, iol_iface_names=None):
     """Схема подключений по линукс-бриджам (tap vunlX_N <-> сосед по бриджу).
@@ -2093,7 +2095,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
                 'vlans': parse_vlan_brief(sections['VLAN']),
                 'trunks': parse_int_trunk(sections.get('TRUNK', [])),
                 'intstat': parse_int_status(sections.get('INTSTAT', [])),
-                'svi_ips': parse_ip_int_svi(sections.get('IPINT', [])),
+                'ipints': parse_ip_int(sections.get('IPINT', [])),
             }
             # Хостнейм свитча — из строки "hostname X" секции RUNCONF;
             # уходит в общую проверку "Имена узлов"
@@ -2284,10 +2286,21 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
             mgmt_result = (m_total - m_wrong, m_total)
 
     # IP менеджмент-SVI по свитчам (из show ip interface): {свитч: 'ip/pfx'|None}
+    # и лишние адреса: вторичные на самом mgmt-SVI + любые адреса на других
+    # интерфейсах свитча (должен быть ровно один адрес — на mgmt-SVI).
     mgmt_ips = {}
+    mgmt_extra = {}
     if mgr_vlan:
+        mgmt_intf = f'Vlan{mgr_vlan}'
         for sw in switches:
-            mgmt_ips[sw] = switch_data.get(sw, {}).get('svi_ips', {}).get(mgr_vlan)
+            ipmap = switch_data.get(sw, {}).get('ipints', {})
+            mgmt_addrs = ipmap.get(mgmt_intf, [])
+            mgmt_ips[sw] = mgmt_addrs[0] if mgmt_addrs else None
+            extra = list(mgmt_addrs[1:])
+            for intf, addrs in ipmap.items():
+                if intf != mgmt_intf:
+                    extra.extend(addrs)
+            mgmt_extra[sw] = extra
 
     # Незадействованные порты коммутаторов должны быть выключены (shutdown).
     # Считаем по свитчу (один элемент = "на свитче все лишние порты погашены"),
@@ -2372,6 +2385,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
     return {'membership': (total - wrong, total), 'trunks': trunks_result,
             'unused': unused_result, 'trunk_prune': prune_result,
             'mgmt': mgmt_result, 'mgr_vlan': mgr_vlan, 'mgmt_ips': mgmt_ips,
+            'mgmt_extra': mgmt_extra,
             'extra_vlans': (extra_plain, extra_used),
             'port_down': port_down,
             'hostnames': switch_hostnames,
@@ -3075,6 +3089,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                         if rip and rip not in ('NONE', 'MULTI', 'DOWN'):
                                             mgmt_ips[member] = rip
                             bad_status = ('NONE', 'MULTI', 'DOWN', None)
+                            mgmt_extra = l2res.get('mgmt_extra') or {}
                             mi_total = 0
                             mi_wrong = 0
                             # каждый свитч обязан иметь IP на менеджмент-SVI
@@ -3083,6 +3098,14 @@ async def ping(request: Request, fmt: str = Query('auto')):
                                 if mgmt_ips.get(sw) in bad_status:
                                     mi_wrong += 1
                                     errors['errors_noty'].append(f'L2: на {sw} нет IP на менеджмент-SVI (interface vlan {mgr})')
+                            # на свитче должен быть ровно один L3-адрес (mgmt-SVI);
+                            # вторичные и адреса на других интерфейсах — ошибка
+                            for sw in switches_l2:
+                                mi_total += 1
+                                ex = mgmt_extra.get(sw) or []
+                                if ex:
+                                    mi_wrong += 1
+                                    errors['errors_noty'].append(f'L2: на {sw} лишние IP-адреса (допустим только адрес менеджмент-VLAN {mgr}): {", ".join(ex)}')
                             valid = [(n, ip) for n, ip in mgmt_ips.items() if ip not in bad_status]
                             # единая подсеть для всех менеджмент-адресов
                             if len(valid) >= 2:

@@ -1939,6 +1939,7 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
 
     # Лишние сабинтерфейсы: vlan id, не соответствующий ни одной группе узла
     # (недостающие уже покрыты сообщением об изоляции выше)
+    mgr_vlan = l2res.get('mgr_vlan')
     member_vlans = {}
     for g in l2res['groups']:
         for member in g['members']:
@@ -1947,7 +1948,8 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
         expected = {v for v in member_vlans.get(member, set()) if v}
         for tap, _sw, _pname in flist:
             for svid in sorted(dict_of_subints.get(tap, {})):
-                if svid not in expected:
+                # менеджмент-сабинтерфейс легитимен, лишним не считается
+                if svid not in expected and svid != mgr_vlan:
                     errs.append(f'L2: у {member} сабинтерфейс в VLAN {svid}, не соответствующий ни одной группе задания')
 
     router_int_result = (r_total - r_wrong, r_total) if r_total else None

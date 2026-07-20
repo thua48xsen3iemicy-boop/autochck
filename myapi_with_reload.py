@@ -1755,6 +1755,22 @@ def parse_vlan_list(text):
             vlans.add(int(part))
     return vlans
 
+def format_vlan_set(vids):
+    """Множество vlan -> компактная строка с диапазонами: {1,10,20,21,22} -> '1,10,20-22'."""
+    vids = sorted(vids)
+    if not vids:
+        return ''
+    parts = []
+    start = prev = vids[0]
+    for v in vids[1:]:
+        if v == prev + 1:
+            prev = v
+        else:
+            parts.append(str(start) if start == prev else f'{start}-{prev}')
+            start = prev = v
+    parts.append(str(start) if start == prev else f'{start}-{prev}')
+    return ','.join(parts)
+
 def parse_vlan_brief(lines):
     """Секция VLAN (show vlan brief) -> {vlan_id: множество access-портов}.
 
@@ -1794,6 +1810,41 @@ def parse_int_trunk(lines):
         elif section == 'active' and len(parts) >= 2 and parts[0] in trunks:
             trunks[parts[0]] = parse_vlan_list(parts[1])
     return trunks
+
+def parse_int_trunk_allowed(lines):
+    """Секция TRUNK -> {порт: множество vlan из блока 'Vlans allowed on trunk'}.
+
+    Это СЫРОЙ список switchport trunk allowed vlan (по умолчанию 1-4094), без
+    пересечения с созданными на свитче. Нужен проверке прунинга: показывает,
+    сузил ли студент список вообще. Длинные списки IOS переносит на следующие
+    строки (без имени порта) — такие продолжения дописываем к последнему порту.
+    """
+    allowed = {}
+    section = 'status'
+    last = None
+    for line in lines:
+        s = line.strip()
+        if s.startswith('Port '):
+            if 'allowed on trunk' in s:
+                section = 'allowed'
+            elif 'allowed and active' in s:
+                section = 'active'
+            else:
+                section = 'other'
+            last = None
+            continue
+        parts = s.split()
+        if not parts:
+            continue
+        if section == 'status' and 'trunking' in parts:
+            allowed.setdefault(parts[0], set())
+        elif section == 'allowed':
+            if parts[0] in allowed and len(parts) >= 2:
+                allowed[parts[0]] |= parse_vlan_list(parts[1])
+                last = parts[0]
+            elif last is not None and re.match(r'^[\d,\-]+$', parts[0]):
+                allowed[last] |= parse_vlan_list(parts[0])
+    return allowed
 
 def parse_int_status(lines):
     """Секция INTSTAT (show int status) -> {порт: статус}.
@@ -2094,6 +2145,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
             switch_data[name] = {
                 'vlans': parse_vlan_brief(sections['VLAN']),
                 'trunks': parse_int_trunk(sections.get('TRUNK', [])),
+                'trunks_allowed': parse_int_trunk_allowed(sections.get('TRUNK', [])),
                 'intstat': parse_int_status(sections.get('INTSTAT', [])),
                 'ipints': parse_ip_int(sections.get('IPINT', [])),
             }
@@ -2204,16 +2256,16 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         if t_total:
             trunks_result = (t_total - t_wrong, t_total)
 
-    # Прунинг транков (только при маркере trunk_prune:on). На межкоммутаторном
-    # транке в allowed-списке должны быть только те VLAN группы, чьи участники
-    # есть по обе стороны линка. Топология — дерево: убираем линк, делим свитчи
-    # на две стороны; VLAN нужен на линке, если hosts группы есть и там, и там.
-    # Смотрим блок "allowed and active", поэтому лишними считаем VLAN, реально
-    # созданные на свитче (несуществующие в allowed трафика тут не несут).
-    # Router-on-a-stick сюда не попадает: его транк не входит в sw_links.
+    # Прунинг транков (только при маркере trunk_prune:on). Смотрим СЫРОЙ список
+    # "Vlans allowed on trunk" (switchport trunk allowed vlan), а не "allowed and
+    # active": по умолчанию транк разрешает 1-4094, и цель проверки — увидеть,
+    # сузил ли студент список до реально необходимых VLAN. На межкоммутаторном
+    # транке допустимы только VLAN групп, чьи участники есть по обе стороны линка
+    # (топология — дерево: убираем линк, делим свитчи на две стороны), плюс native
+    # 1, менеджмент-VLAN и служебные 1002-1005. Router-on-a-stick сюда не попадает:
+    # его транк не входит в sw_links.
     prune_result = None
     if trunk_prune and len(switches) > 1 and sw_links:
-        expected_vlans_p = {g['vlan'] for g in groups if g['vlan']}
         group_hosts = []
         for g in groups:
             if not g['vlan']:
@@ -2223,23 +2275,30 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
                 for sw, _pname in node_ports.get(member, []):
                     hs.add(sw)
             group_hosts.append((g['vlan'], hs))
+        # VLAN, которым позволено быть на любом межкоммутаторном транке
+        always_ok = {1} | set(range(1002, 1006)) | ({mgr_vlan} if mgr_vlan else set())
         surplus_by_sw = {}
         for idx, (sw1, p1, sw2, p2) in enumerate(sw_links):
             side = switches_reachable_without(sw_links, sw1, idx)
             needed = {vid for vid, hs in group_hosts if hs & side and hs - side}
+            legit = needed | always_ok
             for sw, port in ((sw1, p1), (sw2, p2)):
-                allowed = switch_data.get(sw, {}).get('trunks', {}).get(port, set())
-                surplus = sorted(v for v in (allowed & expected_vlans_p) - needed
-                                 if v != 1 and v != mgr_vlan and not 1002 <= v <= 1005)
+                allowed_raw = switch_data.get(sw, {}).get('trunks_allowed', {}).get(port, set())
+                surplus = allowed_raw - legit
                 if surplus:
-                    surplus_by_sw.setdefault(sw, {})[port] = surplus
+                    surplus_by_sw.setdefault(sw, {})[port] = (surplus, needed, allowed_raw)
         trunk_switches = {l[0] for l in sw_links} | {l[2] for l in sw_links}
         p_total = len(trunk_switches & set(switches))
         p_wrong = len(surplus_by_sw)
         for sw in sorted(surplus_by_sw):
             for port in sorted(surplus_by_sw[sw]):
-                vids = ", ".join(str(v) for v in surplus_by_sw[sw][port])
-                errs.append(f'L2: на {sw} транк {port} разрешает лишние VLAN {vids} — сузьте allowed vlan до реально необходимых')
+                surplus, needed, allowed_raw = surplus_by_sw[sw][port]
+                want = format_vlan_set(needed | ({mgr_vlan} if mgr_vlan else set()))
+                if len(surplus) > 32:
+                    # список практически не сужен (обычно дефолт 1-4094)
+                    errs.append(f'L2: на {sw} транк {port}: список allowed vlan не сужен ({format_vlan_set(allowed_raw)}) — оставьте только необходимые ({want or "нет"})')
+                else:
+                    errs.append(f'L2: на {sw} транк {port} разрешает лишние VLAN {format_vlan_set(surplus)} — уберите их из allowed vlan (нужны: {want or "нет"})')
         if p_total:
             prune_result = (p_total - p_wrong, p_total)
 
@@ -2379,6 +2438,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         'sw_links': sw_links,
         'switch_vlans': {sw: {str(vid): sorted(p) for vid, p in d['vlans'].items()} for sw, d in switch_data.items()},
         'switch_trunks': {sw: {p: sorted(v) for p, v in d['trunks'].items()} for sw, d in switch_data.items()},
+        'switch_trunks_allowed': {sw: {p: format_vlan_set(v) for p, v in d.get('trunks_allowed', {}).items()} for sw, d in switch_data.items()},
     }
     # groups/switches/facing/switch_data нужны шагу подмены L1 -> L2
     # (build_l2_domains) после разбора адресов

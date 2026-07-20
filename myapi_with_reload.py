@@ -2197,6 +2197,48 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         if p_total:
             prune_result = (p_total - p_wrong, p_total)
 
+    # Менеджмент-VLAN (mgr_vlan): должен быть создан на каждом коммутаторе и
+    # проходить до всех. Балл на свитч за "создан" + единый балл за сквозную
+    # связность (BFS по транкам, где mgr_vlan allowed&active с обеих сторон —
+    # та же модель, что и vlan_trunks).
+    mgmt_result = None
+    if mgr_vlan and switches:
+        m_total = 0
+        m_wrong = 0
+        created = set()
+        for sw in switches:
+            data = switch_data.get(sw)
+            if not data:
+                continue
+            m_total += 1
+            if mgr_vlan in data['vlans']:
+                created.add(sw)
+            else:
+                m_wrong += 1
+                errs.append(f'L2: на {sw} не создан менеджмент-VLAN {mgr_vlan}')
+        if len(switches) > 1 and sw_links and created:
+            reached = {next(iter(created))}
+            changed = True
+            while changed:
+                changed = False
+                for sw1, p1, sw2, p2 in sw_links:
+                    ok1 = mgr_vlan in switch_data.get(sw1, {}).get('trunks', {}).get(p1, set())
+                    ok2 = mgr_vlan in switch_data.get(sw2, {}).get('trunks', {}).get(p2, set())
+                    if ok1 and ok2:
+                        if sw1 in reached and sw2 not in reached:
+                            reached.add(sw2)
+                            changed = True
+                        elif sw2 in reached and sw1 not in reached:
+                            reached.add(sw1)
+                            changed = True
+            m_total += 1
+            unreached = created - reached
+            if unreached:
+                m_wrong += 1
+                errs.append(f'L2: менеджмент-VLAN {mgr_vlan} не проходит до {", ".join(sorted(unreached))} — проверьте транки')
+        if m_total:
+            mgmt_result = (m_total - m_wrong, m_total)
+
     # Незадействованные порты коммутаторов должны быть выключены (shutdown).
     # Считаем по свитчу (один элемент = "на свитче все лишние порты погашены"),
     # чтобы полтора десятка портов не задавили весь остальной счёт.
@@ -2279,6 +2321,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
     # (build_l2_domains) после разбора адресов
     return {'membership': (total - wrong, total), 'trunks': trunks_result,
             'unused': unused_result, 'trunk_prune': prune_result,
+            'mgmt': mgmt_result, 'mgr_vlan': mgr_vlan,
             'extra_vlans': (extra_plain, extra_used),
             'port_down': port_down,
             'hostnames': switch_hostnames,
@@ -2629,6 +2672,8 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         add_check('vlan_unused_ports', l2res['unused'][0], l2res['unused'][1])
                     if l2res.get('trunk_prune'):
                         add_check('vlan_trunk_prune', l2res['trunk_prune'][0], l2res['trunk_prune'][1])
+                    if l2res.get('mgmt'):
+                        add_check('vlan_mgmt', l2res['mgmt'][0], l2res['mgmt'][1])
                     # Штрафы: max не меняют, вычитаются из итога
                     add_penalty('vlan_extra', l2res['extra_vlans'][0])
                     add_penalty('vlan_extra_used', l2res['extra_vlans'][1])

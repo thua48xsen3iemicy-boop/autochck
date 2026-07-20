@@ -1813,6 +1813,26 @@ def parse_int_status(lines):
             statuses[parts[0]] = status
     return statuses
 
+def parse_ip_int_svi(lines):
+    """Секция IPINT (show ip interface) -> {vlan_id: 'ip/prefix'} для SVI.
+
+    Берём только интерфейсы вида VlanN с настроенным адресом (строка
+    "Internet address is A.B.C.D/xx"). Интерфейсы без адреса пропускаются.
+    """
+    svi = {}
+    cur = None
+    for line in lines:
+        m = re.match(r'^(\S+) is ', line)
+        if m:
+            cur = m.group(1)
+            continue
+        am = re.search(r'Internet address is (\d+\.\d+\.\d+\.\d+/\d+)', line)
+        if am and cur:
+            vm = re.match(r'(?i)vlan(\d+)$', cur)
+            if vm:
+                svi[int(vm.group(1))] = am.group(1)
+    return svi
+
 def build_switch_links(switch_names, dict_of_name_and_intname, bridges, iol_iface_names=None):
     """Схема подключений по линукс-бриджам (tap vunlX_N <-> сосед по бриджу).
 
@@ -1939,6 +1959,7 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
 
     # Лишние сабинтерфейсы: vlan id, не соответствующий ни одной группе узла
     # (недостающие уже покрыты сообщением об изоляции выше)
+    mgr_vlan = l2res.get('mgr_vlan')
     member_vlans = {}
     for g in l2res['groups']:
         for member in g['members']:
@@ -1947,11 +1968,33 @@ def build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints):
         expected = {v for v in member_vlans.get(member, set()) if v}
         for tap, _sw, _pname in flist:
             for svid in sorted(dict_of_subints.get(tap, {})):
-                if svid not in expected:
+                # менеджмент-сабинтерфейс легитимен, лишним не считается
+                if svid not in expected and svid != mgr_vlan:
                     errs.append(f'L2: у {member} сабинтерфейс в VLAN {svid}, не соответствующий ни одной группе задания')
 
+    # Менеджмент-сабинтерфейс на роутере (router-on-a-stick): у роутера должен
+    # быть сабинтерфейс в mgr_vlan. Проверяем только тех роутеров (узел из >1
+    # группы), кто уже использует сабинтерфейсы, чтобы не штрафовать роутеры с
+    # отдельными физическими ногами в свитчи.
+    mgmt_router_result = None
+    if mgr_vlan:
+        mr_total = 0
+        mr_wrong = 0
+        for member, cnt in member_count.items():
+            if cnt <= 1 or member in switches:
+                continue
+            taps = [tap for tap, _sw, _pn in l2res['facing'].get(member, [])]
+            if not any(dict_of_subints.get(tap) for tap in taps):
+                continue  # не router-on-a-stick — сабинтерфейсов нет вовсе
+            mr_total += 1
+            if not any(mgr_vlan in dict_of_subints.get(tap, {}) for tap in taps):
+                mr_wrong += 1
+                errs.append(f'L2: у {member} нет сабинтерфейса в менеджмент-VLAN {mgr_vlan}')
+        if mr_total:
+            mgmt_router_result = (mr_total - mr_wrong, mr_total)
+
     router_int_result = (r_total - r_wrong, r_total) if r_total else None
-    return new_bridges, errs, router_int_result
+    return new_bridges, errs, router_int_result, mgmt_router_result
 
 def switches_reachable_without(sw_links, start, skip_idx):
     """Множество коммутаторов, достижимых от start по sw_links без линка skip_idx.
@@ -2050,6 +2093,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
                 'vlans': parse_vlan_brief(sections['VLAN']),
                 'trunks': parse_int_trunk(sections.get('TRUNK', [])),
                 'intstat': parse_int_status(sections.get('INTSTAT', [])),
+                'svi_ips': parse_ip_int_svi(sections.get('IPINT', [])),
             }
             # Хостнейм свитча — из строки "hostname X" секции RUNCONF;
             # уходит в общую проверку "Имена узлов"
@@ -2197,6 +2241,54 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
         if p_total:
             prune_result = (p_total - p_wrong, p_total)
 
+    # Менеджмент-VLAN (mgr_vlan): должен быть создан на каждом коммутаторе и
+    # проходить до всех. Балл на свитч за "создан" + единый балл за сквозную
+    # связность (BFS по транкам, где mgr_vlan allowed&active с обеих сторон —
+    # та же модель, что и vlan_trunks).
+    mgmt_result = None
+    if mgr_vlan and switches:
+        m_total = 0
+        m_wrong = 0
+        created = set()
+        for sw in switches:
+            data = switch_data.get(sw)
+            if not data:
+                continue
+            m_total += 1
+            if mgr_vlan in data['vlans']:
+                created.add(sw)
+            else:
+                m_wrong += 1
+                errs.append(f'L2: на {sw} не создан менеджмент-VLAN {mgr_vlan}')
+        if len(switches) > 1 and sw_links and created:
+            reached = {next(iter(created))}
+            changed = True
+            while changed:
+                changed = False
+                for sw1, p1, sw2, p2 in sw_links:
+                    ok1 = mgr_vlan in switch_data.get(sw1, {}).get('trunks', {}).get(p1, set())
+                    ok2 = mgr_vlan in switch_data.get(sw2, {}).get('trunks', {}).get(p2, set())
+                    if ok1 and ok2:
+                        if sw1 in reached and sw2 not in reached:
+                            reached.add(sw2)
+                            changed = True
+                        elif sw2 in reached and sw1 not in reached:
+                            reached.add(sw1)
+                            changed = True
+            m_total += 1
+            unreached = created - reached
+            if unreached:
+                m_wrong += 1
+                errs.append(f'L2: менеджмент-VLAN {mgr_vlan} не проходит до {", ".join(sorted(unreached))} — проверьте транки')
+        if m_total:
+            mgmt_result = (m_total - m_wrong, m_total)
+
+    # IP менеджмент-SVI по свитчам (из show ip interface): {свитч: 'ip/pfx'|None}
+    mgmt_ips = {}
+    if mgr_vlan:
+        for sw in switches:
+            mgmt_ips[sw] = switch_data.get(sw, {}).get('svi_ips', {}).get(mgr_vlan)
+
     # Незадействованные порты коммутаторов должны быть выключены (shutdown).
     # Считаем по свитчу (один элемент = "на свитче все лишние порты погашены"),
     # чтобы полтора десятка портов не задавили весь остальной счёт.
@@ -2279,6 +2371,7 @@ async def check_l2_vlans(lab_file, dict_of_name_and_ostype, dict_of_name_and_int
     # (build_l2_domains) после разбора адресов
     return {'membership': (total - wrong, total), 'trunks': trunks_result,
             'unused': unused_result, 'trunk_prune': prune_result,
+            'mgmt': mgmt_result, 'mgr_vlan': mgr_vlan, 'mgmt_ips': mgmt_ips,
             'extra_vlans': (extra_plain, extra_used),
             'port_down': port_down,
             'hostnames': switch_hostnames,
@@ -2629,6 +2722,8 @@ async def ping(request: Request, fmt: str = Query('auto')):
                         add_check('vlan_unused_ports', l2res['unused'][0], l2res['unused'][1])
                     if l2res.get('trunk_prune'):
                         add_check('vlan_trunk_prune', l2res['trunk_prune'][0], l2res['trunk_prune'][1])
+                    if l2res.get('mgmt'):
+                        add_check('vlan_mgmt', l2res['mgmt'][0], l2res['mgmt'][1])
                     # Штрафы: max не меняют, вычитаются из итога
                     add_penalty('vlan_extra', l2res['extra_vlans'][0])
                     add_penalty('vlan_extra_used', l2res['extra_vlans'][1])
@@ -2943,17 +3038,78 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 # топологии — дальше базовая логика идёт без изменений.
                 if l2res:
                     try:
-                        bridges, l2dom_errs, router_int_result = build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints)
+                        bridges, l2dom_errs, router_int_result, mgmt_router_result = build_l2_domains(l2res, bridges, dict_of_name_and_intname, dict_of_subints)
                         errors['errors_noty'].extend(l2dom_errs)
                         # Изоляция сети от роутера не покрывается базовыми
                         # проверками (особенно при подсказке без номеров) —
                         # отдельный пункт с баллами
                         if router_int_result:
                             add_check('vlan_router_int', router_int_result[0], router_int_result[1])
+                        if mgmt_router_result:
+                            add_check('vlan_mgmt_router', mgmt_router_result[0], mgmt_router_result[1])
                         answer['l2_domains'] = str(bridges)
                         answer['l2_subints'] = str(dict_of_subints)
                     except Exception:
                         log('build_l2_domains err', traceback.format_exc())
+
+                    # Менеджмент-IP: адреса на SVI свитчей и сабинтерфейсе роутера.
+                    # Самодостаточная проверка на тех же хелперах, что и общие
+                    # (check_same_network / is_private_network / дедуп), чтобы не
+                    # трогать общий IP-конвейер (Networks сознательно исключает
+                    # интерфейсы свитчей).
+                    try:
+                        mgr = l2res.get('mgr_vlan')
+                        if mgr:
+                            switches_l2 = l2res.get('switches', [])
+                            mgmt_ips = dict(l2res.get('mgmt_ips') or {})
+                            # адрес менеджмент-сабинтерфейса роутера из общей карты;
+                            # его интерфейс-ключи запоминаем, чтобы не считать сам
+                            # с собой дубликатом при проверке уникальности
+                            mgmt_virt_keys = set()
+                            for member, flist in l2res.get('facing', {}).items():
+                                for tap, _sw, _pn in flist:
+                                    virt = dict_of_subints.get(tap, {}).get(mgr)
+                                    if virt:
+                                        mgmt_virt_keys.add(virt)
+                                        rip = dict_of_intnames_ipaddr.get(virt)
+                                        if rip and rip not in ('NONE', 'MULTI', 'DOWN'):
+                                            mgmt_ips[member] = rip
+                            bad_status = ('NONE', 'MULTI', 'DOWN', None)
+                            mi_total = 0
+                            mi_wrong = 0
+                            # каждый свитч обязан иметь IP на менеджмент-SVI
+                            for sw in switches_l2:
+                                mi_total += 1
+                                if mgmt_ips.get(sw) in bad_status:
+                                    mi_wrong += 1
+                                    errors['errors_noty'].append(f'L2: на {sw} нет IP на менеджмент-SVI (interface vlan {mgr})')
+                            valid = [(n, ip) for n, ip in mgmt_ips.items() if ip not in bad_status]
+                            # единая подсеть для всех менеджмент-адресов
+                            if len(valid) >= 2:
+                                mi_total += 1
+                                if not check_same_network([ip for _, ip in valid]):
+                                    mi_wrong += 1
+                                    errors['errors_noty'].append('L2: менеджмент-адреса в разных подсетях: ' + ', '.join(f'{n}={ip}' for n, ip in valid))
+                            # приватность адресов
+                            if valid:
+                                mi_total += 1
+                                notpriv = [(n, ip) for n, ip in valid if not is_private_network(ip)]
+                                if notpriv:
+                                    mi_wrong += 1
+                                    errors['errors_noty'].append('L2: непубличный диапазон нарушен в менеджмент-адресах: ' + ', '.join(f'{n}={ip}' for n, ip in notpriv))
+                            # уникальность: среди менеджмент-адресов и против всех прочих адресов сети
+                            if valid:
+                                mi_total += 1
+                                others = [v for k, v in dict_of_intnames_ipaddr.items() if k not in mgmt_virt_keys and v not in ('NONE', 'MULTI', 'DOWN')]
+                                allcnt = Counter([ip for _, ip in valid] + others)
+                                dup = [(n, ip) for n, ip in valid if allcnt[ip] > 1]
+                                if dup:
+                                    mi_wrong += 1
+                                    errors['errors_noty'].append('L2: менеджмент-адрес дублируется: ' + ', '.join(f'{n}={ip}' for n, ip in dup))
+                            if mi_total:
+                                add_check('vlan_mgmt_ip', mi_total - mi_wrong, mi_total)
+                    except Exception:
+                        log('vlan_mgmt_ip err', traceback.format_exc())
                 # =============== L2 MULTISWITCH: ПОДМЕНА L1 -> L2 END ===============
 
                 for name in list_of_vmnames:

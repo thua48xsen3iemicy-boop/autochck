@@ -31,6 +31,8 @@ CHECK_LABELS = {
     'vlan_unused_ports': 'Отключение неиспользуемых портов',
     'vlan_trunk_prune': 'Сужение allowed VLAN на транках',
     'vlan_mgmt': 'Менеджмент-VLAN на коммутаторах',
+    'vlan_mgmt_router': 'Менеджмент-сабинтерфейс на роутере',
+    'vlan_mgmt_ip': 'IP-адреса менеджмент-VLAN',
     'vlan_extra': 'Лишние VLAN',
     'vlan_extra_used': 'Лишний VLAN на порту узла',
     'vlan_port_shutdown': 'Выключен порт узла',

@@ -1166,6 +1166,7 @@ async def execute_command_with_lock(cmd, ostype, socket_path, name, command_type
 # ONLY_EXTRA = True в файле: оценка лабы только по пунктам этого файла и
 # основным пунктам из KEEP (по умолчанию ['Hostnames']); остальные основные
 # пункты, их штрафы и сообщения об ошибках исключаются (см. /ping).
+# Если файл упал (с флагом или без), результат лабы — ноль баллов.
 
 LAB_CHECKS_DIR = '/pnet/checks'
 
@@ -1222,16 +1223,17 @@ def lab_checks_file(lab_path):
 async def run_lab_checks(ctx):
     """Выполняет доп. проверки лабы, если для неё есть файл в LAB_CHECKS_DIR.
 
-    Ошибка в файле проверок не роняет /ping: трейс уходит в лог, студенту —
-    короткое сообщение, остальная оценка считается как обычно (пункты, до
-    которых check() не дошёл, просто не попадают в оценку).
+    Ошибка в файле проверок не роняет /ping: трейс уходит в лог, а вызывающий
+    код обнуляет результат лабы (иначе оценка считалась бы без доп. пунктов).
 
-    Возвращает None — оценка как обычно, либо (при ONLY_EXTRA = True в файле)
-    список основных пунктов, которые остаются в оценке помимо пунктов файла.
+    Возвращает (keep, failed): keep — None (оценка как обычно) либо, при
+    ONLY_EXTRA = True в файле, список основных пунктов, которые остаются в
+    оценке помимо пунктов файла; failed — None либо сообщение для студента,
+    если файл проверок упал.
     """
     stem, path = lab_checks_file(ctx.lab_path)
     if not os.path.isfile(path):
-        return None
+        return None, None
     log('lab checks', path)
     keep = None
     try:
@@ -1251,8 +1253,9 @@ async def run_lab_checks(ctx):
             await result
     except Exception as e:
         log('lab checks err', traceback.format_exc())
-        ctx.error(f'Ошибка в доп. проверке лабы ({stem}.py): {e!r}. Сообщите преподавателю')
-    return keep
+        return keep, (f'Доп. проверка лабы не выполнена из-за ошибки ({stem}.py): '
+                      f'{type(e).__name__}: {e}. Результат не засчитан, сообщите преподавателю')
+    return keep, None
 
 def remove_ansi_sequences(text):
     ansi_escape = re.compile(r'''
@@ -3846,8 +3849,17 @@ async def ping(request: Request, fmt: str = Query('auto')):
                 lab_ctx = LabCheckContext(
                     lab_path, dict_of_name_and_ostype, dict_of_name_and_path,
                     add_check, errors['errors_noty'], answer)
-                keep = await run_lab_checks(lab_ctx)
-                if keep is not None:
+                keep, failed = await run_lab_checks(lab_ctx)
+                if failed:
+                    # Файл проверок упал: результат не засчитывается — ноль
+                    # баллов и одно сообщение вместо всей разбивки
+                    for d in (checks, penalties):
+                        for name in list(d):
+                            forweb.pop(name, None)
+                        d.clear()
+                    errors['errors_noty'][:] = [failed]
+                    add_check('lab_checks_failed', 0, 1)
+                elif keep is not None:
                     # ONLY_EXTRA: основные пункты (кроме KEEP), их штрафы и
                     # сообщения не входят ни в баллы, ни в max, ни в отчёт
                     keep = set(keep) | lab_ctx.added

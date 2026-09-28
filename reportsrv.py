@@ -147,17 +147,48 @@ async def get_group_pnet(path: str) -> List[str]:
     return await loop.run_in_executor(None, scandir)
 
 
+# Кеш маркера autocheck по файлу лабы: {path: (mtime, bool)} — чтобы /report
+# не перечитывал все .unl всех групп на каждый запрос.
+_autocheck_cache: dict = {}
+
+
+def lab_has_autocheck(path: str) -> bool:
+    """Маркер autocheck:on в <description> лабы (как parse_autocheck в
+    myapi_with_reload.py): только такие лабы учитываются в отчётах.
+    Блокирующая — вызывать через run_in_executor."""
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return False
+    cached = _autocheck_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError as e:
+        logger.warning("Не прочитать лабу %s: %s", path, e)
+        return False
+    m = re.search(r'<description>(.*?)</description>', content, re.DOTALL)
+    pm = m and re.search(r'\bautocheck\s*:\s*(\S+)', m.group(1), re.IGNORECASE)
+    result = bool(pm and pm.group(1).lower() in ('on', 'yes', '1', 'true'))
+    _autocheck_cache[path] = (mtime, result)
+    return result
+
+
 async def get_labs_pnet(path: str) -> List[str]:
-    """Имена файлов-лаб в каталоге группы, включая подпапку REMOTE."""
+    """Имена файлов-лаб с маркером autocheck:on в каталоге группы, включая
+    подпапку REMOTE. Прочие файлы (без маркера, не .unl) пропускаются."""
     def scanfile():
         try:
-            files = [e.name for e in os.scandir(path) if e.is_file()]
+            entries = [e for e in os.scandir(path) if e.is_file()]
         except FileNotFoundError:
             return []
         remote_path = os.path.join(path, 'REMOTE')
         if os.path.isdir(remote_path):
-            files += [e.name for e in os.scandir(remote_path) if e.is_file()]
-        return files
+            entries += [e for e in os.scandir(remote_path) if e.is_file()]
+        return [e.name for e in entries
+                if not e.name.startswith('.') and lab_has_autocheck(e.path)]
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, scanfile)
 

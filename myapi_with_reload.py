@@ -248,6 +248,10 @@ def load_dashboard(db_path=RESULT_DB_PATH):
 
     result = []
     for lp, att in labs.items():
+        # Результаты лаб без маркера autocheck:on (или удалённых) не показываем;
+        # в БД они остаются и вернутся, как только маркер появится
+        if not parse_autocheck('/opt/unetlab/labs' + lp):
+            continue
         # Короткое имя лабы из пути: //GROUPS/OA-2501/KS24.unl -> KS24
         base = lp.rsplit('/', 1)[-1]
         name = base.rsplit('.', 1)[0] if '.' in base else base
@@ -1650,23 +1654,41 @@ def l2_switch_names(dict_of_name_and_ostype, unl_nodes):
                 switches.append(name)
     return switches
 
+def read_lab_description(lab_file):
+    """Текст <description> файла лабы (.unl) либо None, если файла/тега нет."""
+    try:
+        with open(lab_file, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError as e:
+        log('read_lab_description err', e)
+        return None
+    m = re.search(r'<description>(.*?)</description>', content, re.DOTALL)
+    return m.group(1) if m else None
+
+def parse_autocheck(lab_file):
+    """Маркер autocheck:on в <description> лабы: лаба участвует в автопроверке.
+
+    Без маркера /ping отказывает в проверке ('Лаба не участвует в автопроверке'),
+    а /results не показывает результаты этой лабы. Включается только явным
+    on/yes/1/true (регистр не важен). Та же логика — в reportsrv.py.
+    """
+    desc = read_lab_description(lab_file)
+    if desc is None:
+        return False
+    pm = re.search(r'\bautocheck\s*:\s*(\S+)', desc, re.IGNORECASE)
+    return bool(pm and pm.group(1).lower() in ('on', 'yes', '1', 'true'))
+
 def parse_l2_hint(lab_file):
     """Читает L2-подсказку из <description> файла лабы.
 
     Возвращает список групп [{'vlan': int|None, 'members': [имена]}].
     Пустой список — подсказки нет, L2-проверка не выполняется.
     """
-    try:
-        with open(lab_file, encoding='utf-8', errors='replace') as f:
-            content = f.read()
-    except OSError as e:
-        log('parse_l2_hint read err', e)
-        return []
-    m = re.search(r'<description>(.*?)</description>', content, re.DOTALL)
-    if not m:
+    desc = read_lab_description(lab_file)
+    if desc is None:
         return []
     groups = []
-    for grp in re.findall(r'\(([^)]*)\)', m.group(1)):
+    for grp in re.findall(r'\(([^)]*)\)', desc):
         vlan = None
         body = grp
         vm = re.match(r'\s*(\d+)\s*:\s*(.*)$', grp, re.DOTALL)
@@ -1688,16 +1710,10 @@ def parse_cisco_pass(lab_file):
     Возвращает строку пароля либо None, если маркера нет. При None вызывающий
     код работает как раньше — с дефолтным cissecret.
     """
-    try:
-        with open(lab_file, encoding='utf-8', errors='replace') as f:
-            content = f.read()
-    except OSError as e:
-        log('parse_cisco_pass read err', e)
+    desc = read_lab_description(lab_file)
+    if desc is None:
         return None
-    m = re.search(r'<description>(.*?)</description>', content, re.DOTALL)
-    if not m:
-        return None
-    pm = re.search(r'cisco_pass\s*:\s*(\S+)', m.group(1), re.IGNORECASE)
+    pm = re.search(r'cisco_pass\s*:\s*(\S+)', desc, re.IGNORECASE)
     if pm:
         return pm.group(1)
     return None
@@ -1710,16 +1726,10 @@ def parse_trunk_prune(lab_file):
     Возвращает True только при явном on/yes/1/true (регистр не важен); иначе
     False — старые лабы без маркера проверку не получают.
     """
-    try:
-        with open(lab_file, encoding='utf-8', errors='replace') as f:
-            content = f.read()
-    except OSError as e:
-        log('parse_trunk_prune read err', e)
+    desc = read_lab_description(lab_file)
+    if desc is None:
         return False
-    m = re.search(r'<description>(.*?)</description>', content, re.DOTALL)
-    if not m:
-        return False
-    pm = re.search(r'trunk_prune\s*:\s*(\S+)', m.group(1), re.IGNORECASE)
+    pm = re.search(r'trunk_prune\s*:\s*(\S+)', desc, re.IGNORECASE)
     return bool(pm and pm.group(1).lower() in ('on', 'yes', '1', 'true'))
 
 def parse_mgr_vlan(lab_file):
@@ -1730,16 +1740,10 @@ def parse_mgr_vlan(lab_file):
     лишним в allowed-списке транка при проверке прунинга. Возвращает int либо
     None, если маркера нет.
     """
-    try:
-        with open(lab_file, encoding='utf-8', errors='replace') as f:
-            content = f.read()
-    except OSError as e:
-        log('parse_mgr_vlan read err', e)
+    desc = read_lab_description(lab_file)
+    if desc is None:
         return None
-    m = re.search(r'<description>(.*?)</description>', content, re.DOTALL)
-    if not m:
-        return None
-    pm = re.search(r'mgr_vlan\s*:\s*(\d+)', m.group(1), re.IGNORECASE)
+    pm = re.search(r'mgr_vlan\s*:\s*(\d+)', desc, re.IGNORECASE)
     return int(pm.group(1)) if pm else None
 
 def parse_vlan_list(text):
@@ -2653,7 +2657,16 @@ async def ping(request: Request, fmt: str = Query('auto')):
 
 
         log('_________________________________', f'START for {username}')
-        if lab != 'moreone' and lab != 'no':
+        lab_opened = lab != 'moreone' and lab != 'no'
+        if lab_opened and not parse_autocheck('/opt/unetlab/labs' + str(lab[1])):
+            # Лаба без маркера autocheck:on в описании не проверяется и в БД
+            # не попадает (save_run только при status 200)
+            log('lab without autocheck:on', str(lab[1]))
+            answer['lab_path'] = str(lab[1])
+            forweb['lab_path'] = str(lab[1])
+            answer['errorinfo'] = 'Лаба не участвует в автопроверке'
+            answer['status'] = 'warn'
+        elif lab_opened:
             #return(lab[1])
             lab_path = '/opt/unetlab/labs' + str(lab[1])
             answer['lab_path'] = str(lab[1])

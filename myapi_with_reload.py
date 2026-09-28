@@ -22,6 +22,8 @@ import chardet
 import ipaddress
 from collections import Counter
 import traceback
+import types
+import inspect
 from datetime import datetime
 import pexpect
 
@@ -1152,6 +1154,92 @@ async def execute_command_with_lock(cmd, ostype, socket_path, name, command_type
             result = "NONE"
         #print('return', name)
         return name, command_type, result, ostype
+
+############################################################ LAB CHECKS
+# Дополнительные проверки конкретных лаб вынесены из этого файла в
+# /pnet/checks/<имя .unl без расширения>.py (например OSIS_PR1.py для
+# OSIS_PR1.unl в любой группе). В файле — функция check(ctx), async или
+# обычная; ctx — LabCheckContext. Файл читается заново на каждую проверку,
+# поэтому правки применяются без рестарта сервиса. Шаблон и пример —
+# checks/ в репозитории.
+
+LAB_CHECKS_DIR = '/pnet/checks'
+
+# ostype узла лабы -> тип оболочки для qemu-guest-agent (execute_command)
+QGA_OSTYPES = {'linux': 'linux', 'win': 'windows', 'winserver': 'windows'}
+
+class LabCheckContext:
+    """То, что доступно файлу доп. проверок лабы.
+
+    ctx.run(node, cmd)          — вывод команды на узле (Linux/Windows через
+                                  qemu-guest-agent); 'NONE', если узла нет, ОС не
+                                  поддерживается или узел не ответил
+    ctx.error(msg)              — сообщение в ошибки студента
+    ctx.add_check(name, s, max) — пункт оценки (тот же add_check, что в /ping)
+    ctx.nodes, ctx.ostype       — имена узлов лабы и их тип ОС
+    ctx.lab_path                — полный путь к .unl
+    ctx.answer                  — словарь ответа /ping (отладка, JSON админу)
+    """
+    def __init__(self, lab_path, dict_of_name_and_ostype, dict_of_name_and_path,
+                 add_check, errors_list, answer):
+        self.lab_path = lab_path
+        self.ostype = dict(dict_of_name_and_ostype)
+        self.nodes = sorted(self.ostype)
+        self.answer = answer
+        self._paths = dict_of_name_and_path
+        self._add_check = add_check
+        self._errors = errors_list
+
+    async def run(self, node, cmd):
+        qga = QGA_OSTYPES.get(self.ostype.get(node))
+        path = self._paths.get(node)
+        if not qga or not path:
+            log('lab check: node not found or unsupported', f'{node} {self.ostype.get(node)}')
+            return 'NONE'
+        try:
+            _name, _type, out, _os = await execute_command(cmd, qga, path, node, 'labcheck')
+        except Exception as e:
+            log('lab check run err', f'{node}: {e!r}')
+            return 'NONE'
+        return out
+
+    def error(self, msg):
+        self._errors.append(msg)
+
+    def add_check(self, name, score, maxv):
+        self._add_check(name, score, maxv)
+
+def lab_checks_file(lab_path):
+    stem = os.path.basename(lab_path).rsplit('.', 1)[0]
+    return stem, os.path.join(LAB_CHECKS_DIR, stem + '.py')
+
+async def run_lab_checks(ctx):
+    """Выполняет доп. проверки лабы, если для неё есть файл в LAB_CHECKS_DIR.
+
+    Ошибка в файле проверок не роняет /ping: трейс уходит в лог, студенту —
+    короткое сообщение, остальная оценка считается как обычно (пункты, до
+    которых check() не дошёл, просто не попадают в оценку).
+    """
+    stem, path = lab_checks_file(ctx.lab_path)
+    if not os.path.isfile(path):
+        return
+    log('lab checks', path)
+    try:
+        # Без importlib/sys.modules: исходник читается и исполняется заново
+        # каждый раз, никакого кеша байткода
+        module = types.ModuleType(f'lab_checks_{stem}')
+        module.__file__ = path
+        with open(path, encoding='utf-8') as f:
+            exec(compile(f.read(), path, 'exec'), module.__dict__)
+        check = getattr(module, 'check', None)
+        if not callable(check):
+            raise AttributeError('в файле нет функции check(ctx)')
+        result = check(ctx)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as e:
+        log('lab checks err', traceback.format_exc())
+        ctx.error(f'Ошибка в доп. проверке лабы ({stem}.py): {e!r}. Сообщите преподавателю')
 
 def remove_ansi_sequences(text):
     ansi_escape = re.compile(r'''
@@ -3740,99 +3828,10 @@ async def ping(request: Request, fmt: str = Query('auto')):
 
 
 
-                if 'OSIS_PR1.unl' in lab_path:
-                    chk_count = 28
-                    err_count = 0
-                    name = 'FS'
-                    tasks = []
-                    answer['df-h'] = []
-                    task = asyncio.ensure_future(execute_command("ls -l /mnt/ |grep data && ls -l /mnt/ |grep 5gb && ls -l /mnt/ |grep 9gb && echo OKMOUNTPOINT", 'linux', dict_of_name_and_path[name], name, 'mountpoint'))  
-                    tasks.append(task)
-                    list_of_mountpoints = await asyncio.gather(*tasks)
-                    for result in list_of_mountpoints:
-                        if 'OKMOUNTPOINT' not in result[2]:
-                            errors['errors_noty'].append(f'Похоже не созданны какие-то mountpoints или имеют имена не по заданию: {name}')
-                            err_count = err_count + 3
-
-                    tasks = []
-                    task = asyncio.ensure_future(execute_command("df -hT |grep data && df -hT |grep 5gb && df -hT |grep 9gb && echo OKMOUNTED", 'linux', dict_of_name_and_path[name], name, 'mountpoint'))  
-                    tasks.append(task)
-                    list_of_mountpoints = await asyncio.gather(*tasks)
-                    for result in list_of_mountpoints:
-
-                        if 'OKMOUNTED' not in result[2]:
-                            errors['errors_noty'].append(f'Похоже какието разделы не смонтированны: {name}')
-                            err_count = err_count + 3
-                        for res in result[2].split('\n'):
-                            answer['df-h'].append(res)
-                        if answer['df-h'][0] == 'NONE':
-                            err_count = err_count + 9
-                        else:
-                            vdb1 = 0
-                            vdc1 = 0
-                            vdc2 = 0
-                            for res in answer['df-h']:
-                                if 'data' in res and 'ext3' in res:
-                                    vdb1 = 1
-                            for res in answer['df-h']:
-                                if '5gb' in res and 'ext4' in res:
-                                    vdc1 = 1
-                            for res in answer['df-h']:
-                                if '9gb' in res and 'ext3' in res:
-                                    vdc2 = 1
-                            if vdb1 == 0 or vdc1 == 0 or vdc2 == 0:
-                                err_count = err_count + 3
-                                errors['errors_noty'].append(f'Похоже файловые системы не по заданию: {name}')
-                            tasks = []
-                            task = asyncio.ensure_future(execute_command("umount -f /mnt/data;umount -f /mnt/5gb;umount -f /mnt/9gb", 'linux', dict_of_name_and_path[name], name, 'mountpoint'))
-                            tasks.append(task)
-                            list_of_fstab = await asyncio.gather(*tasks)
-                            tasks = []
-                            task = asyncio.ensure_future(execute_command("mount -a", 'linux', dict_of_name_and_path[name], name, 'mountpoint'))
-                            tasks.append(task)
-                            list_of_fstab = await asyncio.gather(*tasks)
-                            tasks = []
-                            task = asyncio.ensure_future(execute_command("df -hT |grep data && df -hT |grep 5gb && df -hT |grep 9gb && echo OKMOUNTED", 'linux', dict_of_name_and_path[name], name, 'mountpoint'))  
-                            tasks.append(task)
-                            list_of_mountpoints2 = await asyncio.gather(*tasks)
-                            for result2 in list_of_mountpoints2:
-                                if 'OKMOUNTED' not in result2[2]:
-                                    errors['errors_noty'].append(f'Похоже какието проблемы с конфигурацией fstab: {name}')
-                                    err_count = err_count + 6
-                    keyforchk = '3PkBGcuy1vP4Op1JRSqY2PN2CEetwFMGA6dgHdRbWs1quL/u6A9+blPxJ17xb3HCWPiUhAACAj2m48ptzJ3sdYhu81pcV6TUa65cOJtt3FYcWa+KXnWdbY2eS3UgIYFfvQmjK'
-
-                    name = 'SSHDSRV'
-                    tasks = []
-                    # answer['keyfile'] = []
-                    task = asyncio.ensure_future(execute_command("ls / |grep -c keyfolder && echo FOLDEROK;ls /keyfolder/keyfile && echo FILEOK;cat /keyfolder/keyfile", 'linux', dict_of_name_and_path[name], name, 'key'))  
-                    tasks.append(task)
-                    list_of_keys = await asyncio.gather(*tasks)
-                    for result in list_of_keys:
-                        # answer['keyfile'].append(result[2])
-                        if 'FOLDEROK' not in result[2]:
-                            errors['errors_noty'].append(f'Каталог keyfolder не найден: {name}')
-                            err_count = err_count + 2
-                        if 'FILEOK' not in result[2]:
-                            errors['errors_noty'].append(f'Файл keyfile не найден: {name}')
-                            err_count = err_count + 2
-                        if keyforchk not in result[2]:
-                            errors['errors_noty'].append(f'Содержимое файла keyfile не по заданию: {name}')
-                            err_count = err_count + 3
-                    
-                    tasks = []
-                    # answer['keyfile'] = []
-                    task = asyncio.ensure_future(execute_command("ls /root/.ssh/authorized_keys && echo KEYSOK", 'linux', dict_of_name_and_path[name], name, 'key'))  
-                    tasks.append(task)
-                    list_of_keys = await asyncio.gather(*tasks)
-                    for result in list_of_keys:
-                        # answer['keyfile'].append(result[2])
-                        if 'KEYSOK' not in result[2]:
-                            errors['errors_noty'].append(f'Похоже аутентификация по ключам не настроенна: {name}')
-                            err_count = err_count + 3
-                        
-
-                    good_count = chk_count - err_count
-                    add_check('special', good_count, chk_count)
+                # Доп. проверки конкретной лабы из /pnet/checks/<лаба>.py
+                await run_lab_checks(LabCheckContext(
+                    lab_path, dict_of_name_and_ostype, dict_of_name_and_path,
+                    add_check, errors['errors_noty'], answer))
 
 
 

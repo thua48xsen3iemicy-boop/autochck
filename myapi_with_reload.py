@@ -1162,6 +1162,10 @@ async def execute_command_with_lock(cmd, ostype, socket_path, name, command_type
 # обычная; ctx — LabCheckContext. Файл читается заново на каждую проверку,
 # поэтому правки применяются без рестарта сервиса. Шаблон и пример —
 # checks/ в репозитории.
+#
+# ONLY_EXTRA = True в файле: оценка лабы только по пунктам этого файла и
+# основным пунктам из KEEP (по умолчанию ['Hostnames']); остальные основные
+# пункты, их штрафы и сообщения об ошибках исключаются (см. /ping).
 
 LAB_CHECKS_DIR = '/pnet/checks'
 
@@ -1189,6 +1193,7 @@ class LabCheckContext:
         self._paths = dict_of_name_and_path
         self._add_check = add_check
         self._errors = errors_list
+        self.added = set()  # имена пунктов, добавленных файлом проверок
 
     async def run(self, node, cmd):
         qga = QGA_OSTYPES.get(self.ostype.get(node))
@@ -1207,6 +1212,7 @@ class LabCheckContext:
         self._errors.append(msg)
 
     def add_check(self, name, score, maxv):
+        self.added.add(name)
         self._add_check(name, score, maxv)
 
 def lab_checks_file(lab_path):
@@ -1219,11 +1225,15 @@ async def run_lab_checks(ctx):
     Ошибка в файле проверок не роняет /ping: трейс уходит в лог, студенту —
     короткое сообщение, остальная оценка считается как обычно (пункты, до
     которых check() не дошёл, просто не попадают в оценку).
+
+    Возвращает None — оценка как обычно, либо (при ONLY_EXTRA = True в файле)
+    список основных пунктов, которые остаются в оценке помимо пунктов файла.
     """
     stem, path = lab_checks_file(ctx.lab_path)
     if not os.path.isfile(path):
-        return
+        return None
     log('lab checks', path)
+    keep = None
     try:
         # Без importlib/sys.modules: исходник читается и исполняется заново
         # каждый раз, никакого кеша байткода
@@ -1231,6 +1241,8 @@ async def run_lab_checks(ctx):
         module.__file__ = path
         with open(path, encoding='utf-8') as f:
             exec(compile(f.read(), path, 'exec'), module.__dict__)
+        if getattr(module, 'ONLY_EXTRA', False):
+            keep = list(getattr(module, 'KEEP', ['Hostnames']))
         check = getattr(module, 'check', None)
         if not callable(check):
             raise AttributeError('в файле нет функции check(ctx)')
@@ -1240,6 +1252,7 @@ async def run_lab_checks(ctx):
     except Exception as e:
         log('lab checks err', traceback.format_exc())
         ctx.error(f'Ошибка в доп. проверке лабы ({stem}.py): {e!r}. Сообщите преподавателю')
+    return keep
 
 def remove_ansi_sequences(text):
     ansi_escape = re.compile(r'''
@@ -3829,9 +3842,21 @@ async def ping(request: Request, fmt: str = Query('auto')):
 
 
                 # Доп. проверки конкретной лабы из /pnet/checks/<лаба>.py
-                await run_lab_checks(LabCheckContext(
+                main_errors_count = len(errors['errors_noty'])
+                lab_ctx = LabCheckContext(
                     lab_path, dict_of_name_and_ostype, dict_of_name_and_path,
-                    add_check, errors['errors_noty'], answer))
+                    add_check, errors['errors_noty'], answer)
+                keep = await run_lab_checks(lab_ctx)
+                if keep is not None:
+                    # ONLY_EXTRA: основные пункты (кроме KEEP), их штрафы и
+                    # сообщения не входят ни в баллы, ни в max, ни в отчёт
+                    keep = set(keep) | lab_ctx.added
+                    for d in (checks, penalties):
+                        for name in [n for n in d if n not in keep]:
+                            del d[name]
+                            forweb.pop(name, None)
+                    del errors['errors_noty'][:main_errors_count]
+                    log('lab checks only_extra, kept', sorted(keep))
 
 
 

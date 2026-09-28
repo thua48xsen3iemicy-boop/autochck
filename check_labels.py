@@ -36,6 +36,7 @@ CHECK_LABELS = {
     'vlan_extra': 'Лишние VLAN',
     'vlan_extra_used': 'Лишний VLAN на порту узла',
     'vlan_port_shutdown': 'Выключен порт узла',
+    'lab_checks_failed': 'Доп. проверки лабы не выполнены',
 }
 
 

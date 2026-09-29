@@ -21,6 +21,10 @@
   header.top .meta { color: var(--muted); font-size: 13px; }
   .notice { background: #fff6e5; border: 1px solid #f0d089; color: #7a5405; padding: 12px 14px; border-radius: 10px; margin-bottom: 20px; }
   .notice.err { background: #fdeaea; border-color: #f0a9a9; color: #8a2020; }
+  .notice .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .notice .actions a { display: inline-block; padding: 7px 14px; border-radius: 8px; text-decoration: none;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink); font-weight: 600; }
+  .notice .actions a.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .empty { color: var(--muted); }
 
   .sortbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
@@ -132,7 +136,14 @@
   </header>
 
   {% if notice %}
-  <div class="notice{% if status == 'err' %} err{% endif %}">{{ notice }}</div>
+  <div class="notice{% if status == 'err' %} err{% endif %}">{{ notice }}
+    {% if confirm %}
+    <div class="actions">
+      <a class="primary" href="ping?confirm=1">Запустить проверку</a>
+      <a href="results">Отмена</a>
+    </div>
+    {% endif %}
+  </div>
   {% endif %}
 
   {% if not labs %}

@@ -262,6 +262,28 @@ def load_dashboard(db_path=RESULT_DB_PATH):
     result.sort(key=lambda l: l['latest']['id'], reverse=True)
     return result
 
+def count_lab_attempts(lab_path, db_path=RESULT_DB_PATH):
+    """Число засчитанных проверок лабы (для лимита try:N в описании).
+
+    Считаются сохранённые прогоны (в БД попадают только status 200), кроме
+    тех, где упал файл доп. проверок (пункт lab_checks_failed): ошибка
+    преподавателя не должна съедать попытку студента.
+    """
+    if not os.path.exists(db_path):
+        return 0
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            return conn.execute(
+                """SELECT COUNT(*) FROM runs WHERE lab_path = ? AND status = '200'
+                   AND id NOT IN (SELECT run_id FROM check_items WHERE name = 'lab_checks_failed')""",
+                (lab_path,)).fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        log('count_lab_attempts err', e)
+        return 0
+
 def cidr_to_network_mask(cidr: str) -> str:
     """
     Принимает строку вида "10.1.2.2/30" и возвращает 
@@ -1782,6 +1804,16 @@ def parse_autocheck(lab_file):
     pm = re.search(r'\bautocheck\s*:\s*(\S+)', desc, re.IGNORECASE)
     return bool(pm and pm.group(1).lower() in ('on', 'yes', '1', 'true'))
 
+def parse_try_limit(lab_file):
+    """Маркер try:N в <description> лабы: сколько раз студент может запустить
+    проверку этой лабы (N >= 1). None — без ограничения."""
+    desc = read_lab_description(lab_file)
+    if desc is None:
+        return None
+    pm = re.search(r'\btry\s*:\s*(\d+)', desc, re.IGNORECASE)
+    n = int(pm.group(1)) if pm else 0
+    return n if n > 0 else None
+
 def parse_l2_hint(lab_file):
     """Читает L2-подсказку из <description> файла лабы.
 
@@ -2600,11 +2632,13 @@ async def openlab():
     else:
         return None
 
-async def render_dashboard(request: Request, notice=None, status=None, current_lab=None):
+async def render_dashboard(request: Request, notice=None, status=None, current_lab=None, confirm=False):
     """Общий рендер дашборда результатов из SQLite.
 
     current_lab — путь лабы, чью детальную выдачу открыть по умолчанию (например,
     только что проверенная). Если не задан/не найден — открывается самая свежая.
+    confirm — показать под notice кнопки «Запустить проверку» / «Отмена»
+    (лаба с лимитом попыток try:N).
     """
     loop = asyncio.get_event_loop()
     labs = await loop.run_in_executor(None, load_dashboard)
@@ -2623,6 +2657,7 @@ async def render_dashboard(request: Request, notice=None, status=None, current_l
         "clientip": str(clientip),
         "notice": notice,
         "status": status,
+        "confirm": confirm,
     })
 
 @app.get("/results", response_class=HTMLResponse)
@@ -2645,7 +2680,7 @@ linux_nftrules_cmd = 'nft list ruleset'
 LINUX_SECTIONS = ('SSHD', 'DNSSERVER', 'IPADDR', 'IPROUTE', 'HOSTNAME', 'FORWARDING', 'DNSCLI', 'NFTSERVICE', 'DHCPDINSTALL', 'DHCPDRUN')
 WIN_SECTIONS = ('IPADDR', 'IPROUTE', 'HOSTNAME', 'DNSCLI')
 @app.get("/ping")
-async def ping(request: Request, fmt: str = Query('auto')):
+async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(0)):
     try:
         current_time = datetime.now()
         formatted_time = current_time.strftime("%d.%m.%Y %H:%M")
@@ -2762,6 +2797,14 @@ async def ping(request: Request, fmt: str = Query('auto')):
 
         log('_________________________________', f'START for {username}')
         lab_opened = lab != 'moreone' and lab != 'no'
+        # Лимит попыток (try:N в описании): лаба с лимитом запускается только
+        # с подтверждением (?confirm=1), исчерпанный лимит — отказ
+        try_limit = try_used = None
+        confirm_needed = False
+        if lab_opened:
+            try_limit = parse_try_limit('/opt/unetlab/labs' + str(lab[1]))
+            if try_limit:
+                try_used = count_lab_attempts(str(lab[1]))
         if lab_opened and not parse_autocheck('/opt/unetlab/labs' + str(lab[1])):
             # Лаба без маркера autocheck:on в описании не проверяется и в БД
             # не попадает (save_run только при status 200)
@@ -2770,6 +2813,22 @@ async def ping(request: Request, fmt: str = Query('auto')):
             forweb['lab_path'] = str(lab[1])
             answer['errorinfo'] = 'Лаба не участвует в автопроверке'
             answer['status'] = 'warn'
+        elif try_limit and try_used >= try_limit:
+            log('lab try limit reached', f'{lab[1]} {try_used}/{try_limit}')
+            answer['lab_path'] = str(lab[1])
+            forweb['lab_path'] = str(lab[1])
+            answer['errorinfo'] = (f'Попытки проверки этой лабы исчерпаны ({try_used} из {try_limit}). '
+                                   'Результат — в истории ниже')
+            answer['status'] = 'warn'
+        elif try_limit and not confirm:
+            answer['lab_path'] = str(lab[1])
+            forweb['lab_path'] = str(lab[1])
+            answer['errorinfo'] = (f'Для этой лабы доступно попыток проверки: {try_limit}, '
+                                   f'осталось: {try_limit - try_used}. После запуска попытка будет '
+                                   'израсходована. Запустить проверку?')
+            answer['confirm_required'] = True
+            answer['status'] = 'warn'
+            confirm_needed = True
         elif lab_opened:
             #return(lab[1])
             lab_path = '/opt/unetlab/labs' + str(lab[1])
@@ -4025,7 +4084,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
         # Результаты теперь в SQLite (см. save_run ниже); forFileResult идёт в debug_json.
         print('start def final return')
         
-        selected_names = ["lab_path", "status", "username", "time", "errors_noty", "errorinfo"]
+        selected_names = ["lab_path", "status", "username", "time", "errors_noty", "errorinfo", "confirm_required"]
     
             
         # Подстрока для поиска в именах
@@ -4073,7 +4132,7 @@ async def ping(request: Request, fmt: str = Query('auto')):
         if answer['status'] != '200':
             notice = answer.get('errorinfo') or forweb.get('lab_path')
         return await render_dashboard(request, notice=notice, status=answer['status'],
-                                      current_lab=answer.get('lab_path'))
+                                      current_lab=answer.get('lab_path'), confirm=confirm_needed)
 
 
     except Exception:

@@ -15,7 +15,8 @@
     в URL (пробелы в конце строк и финальный перевод строки не важны);
   - в root сайтов нет ничего, кроме файлов эталона и их каталогов.
 
-Оценка только по этим пунктам и Hostnames (ONLY_EXTRA).
+Оценка только по этим пунктам и Hostnames (ONLY_EXTRA). Если на каком-то
+app-узле нет KEY_PACKAGE (nginx), все пункты — 0 (см. KEY_PACKAGE).
 На сервере лежит в /pnet/checks/OKFKS6-demo.py.
 """
 
@@ -32,6 +33,9 @@ APP_IPS = {'app1': '10.0.1.1', 'app2': '10.0.1.2', 'app3': '10.0.1.3', 'app4': '
 PACKAGES = ['nginx', 'tree']
 CONF_DIR = '/etc/nginx/conf.d'
 REQUIRE_LISTEN = True        # listen 80 должен быть указан явно
+# Ключевой пакет: если его нет хотя бы на одном app-узле (или узел не ответил
+# и проверить нельзя), все пункты лабы — 0, остальное не засчитывается
+KEY_PACKAGE = 'nginx'
 
 # сайт: (узел, root, индексный файл)
 SITES = {
@@ -464,11 +468,31 @@ def check_r(out, score, errors):
             errors.append(f'{R_NODE}: {full} — {problem}')
 
 
+def key_package_missing(node, out):
+    """None, если KEY_PACKAGE на узле установлен, иначе причина."""
+    if not responded(out):
+        return f'{node} (узел не ответил)'
+    pkgs = dict(line.split(' ', 1) for line in sections(out).get('PKG', []) if ' ' in line)
+    return None if pkgs.get(KEY_PACKAGE) == 'OK' else node
+
+
 async def check(ctx):
     nodes = list(APP_IPS)
     outs = await asyncio.gather(ctx.run(R_NODE, r_script()),
                                 *(ctx.run(node, app_script(node)) for node in nodes))
     score, errors, remarks = Score(), [], []
+    if KEY_PACKAGE:
+        missing = [m for m in (key_package_missing(n, o) for n, o in zip(nodes, outs[1:])) if m]
+        if missing:
+            # Ключевое требование не выполнено: пункты с полным max, но 0 баллов
+            check_r(outs[0], score, [])
+            for node, out in zip(nodes, outs[1:]):
+                check_app(node, out, score, [], [])
+            ctx.error(f'{KEY_PACKAGE} не установлен: {", ".join(missing)}. Ключевое требование '
+                      'лабы не выполнено — результат обнулён, остальное не засчитывается')
+            for key in POINTS:
+                ctx.add_check(LABELS[key], 0, score.max[key])
+            return
     check_r(outs[0], score, errors)
     for node, out in zip(nodes, outs[1:]):
         check_app(node, out, score, errors, remarks)

@@ -76,12 +76,13 @@ async def get_users_online(user: str) -> str:
 
 
 async def fetch_student_data(url: str):
-    """Живой опрос машины студента: {url}/ping."""
+    """Живой опрос машины студента: {url}/ping?run=1&fmt=json — запускает
+    проверку (простой /ping её не запускает) и отдаёт JSON, а не дашборд."""
     try:
         async with httpx.AsyncClient(verify=INTERNAL_VERIFY, timeout=HTTP_TIMEOUT) as client:
-            response = await client.get(f"{url}/ping")
+            response = await client.get(f"{url}/ping", params={'run': 1, 'fmt': 'json'})
             return response.json() if response.status_code == 200 else None
-    except httpx.HTTPError as e:
+    except (httpx.HTTPError, ValueError) as e:
         logger.warning("Ошибка опроса %s: %s", url, e)
         return None
 

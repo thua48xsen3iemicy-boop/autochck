@@ -2736,7 +2736,16 @@ linux_nftrules_cmd = 'nft list ruleset'
 LINUX_SECTIONS = ('SSHD', 'DNSSERVER', 'IPADDR', 'IPROUTE', 'HOSTNAME', 'FORWARDING', 'DNSCLI', 'NFTSERVICE', 'DHCPDINSTALL', 'DHCPDRUN')
 WIN_SECTIONS = ('IPADDR', 'IPROUTE', 'HOSTNAME', 'DNSCLI')
 @app.get("/ping")
-async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(0)):
+async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(0),
+               run: int = Query(0)):
+    # Проверка запускается только явно: кнопкой «Проверить» (?run=1) или
+    # подтверждением лабы с лимитом попыток (?confirm=1). Простой заход на
+    # /ping только показывает дашборд
+    if not (run or confirm):
+        if fmt == 'json':
+            return {'username': username, 'status': 'idle',
+                    'errorinfo': 'Проверка не запускалась (нужен ?run=1)'}
+        return await render_dashboard(request)
     try:
         current_time = datetime.now()
         formatted_time = current_time.strftime("%d.%m.%Y %H:%M")

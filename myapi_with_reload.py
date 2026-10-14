@@ -1396,6 +1396,9 @@ async def run_lab_checks(ctx):
             keep = list(getattr(module, 'KEEP', ['Hostnames']))
         check = getattr(module, 'check', None)
         if not callable(check):
+            if callable(getattr(module, 'prepare', None)):
+                # Файл только с подготовкой лабы — доп. проверок нет
+                return None, None
             raise AttributeError('в файле нет функции check(ctx)')
         result = check(ctx)
         if inspect.isawaitable(result):
@@ -1890,7 +1893,8 @@ async def run_prepare(request, fmt):
         await loop.run_in_executor(None, save_prep, lab_rel, token, ctx.touched,
                                    labprep.variant_items(v))
         nodes = ', '.join(ctx.touched) or 'настраивать было нечего'
-        return await reply(f'Лаба подготовлена (узлы: {nodes}). Ваш вариант — в блоке лабы ниже. '
+        about_variant = ' Ваш вариант — в блоке лабы ниже.' if (v or labprep.task_text(module, v)) else ''
+        return await reply(f'Лаба подготовлена (узлы: {nodes}).{about_variant} '
                            'Выполните задание и нажмите «Проверить».', 'ok', lab_rel)
     except Exception as e:
         log('lab prepare err', traceback.format_exc())

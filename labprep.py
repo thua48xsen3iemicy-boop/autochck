@@ -636,7 +636,8 @@ MARKER_READ_CMD = f'cat {MARKER_PATH} 2>/dev/null || true'
 
 # Что подставляется в файл лабы без импорта (VARIANT пишется как есть)
 BUILDERS = {'net': net, 'nets': nets, 'subnets': subnets, 'host_in': host_in,
-            'choice': choice, 'number': number, 'text': text}
+            'choice': choice, 'number': number, 'text': text,
+            'PrepareError': PrepareError}
 
 
 def load_module(path):

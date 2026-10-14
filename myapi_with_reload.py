@@ -1834,8 +1834,8 @@ async def prep_gate(lab_rel):
     if bad:
         log('prep markers missing', bad)
         return (f'Проверка не выполнена: узлы {", ".join(bad)} сброшены после подготовки (wipe). '
-                'Нажмите «Подготовить лабу» ещё раз — подготовка повторится на всех узлах, '
-                'затем восстановите свою работу на сброшенных узлах и нажмите «Проверить».')
+                'Нажмите «Подготовить заново» — подготовка повторится только на сброшенных узлах '
+                '(остальные не изменятся), затем восстановите на них свою работу и нажмите «Проверить».')
     return None
 
 async def run_prepare(request, fmt):
@@ -1880,9 +1880,30 @@ async def run_prepare(request, fmt):
         if not isinstance(ostype, dict):
             return await reply(nodes_run_message(diag, 'Подготовка', 'Подготовить лабу'), 'warn', lab_rel)
         v, token = lab_variant(module, stem)
+        loop = asyncio.get_event_loop()
         exec_fn, console_fn = make_node_fns(ostype, lab_file)
         ctx = labprep.PrepareContext(v, ostype, exec_fn, username, stem, console_fn=console_fn)
         log('lab prepare', f'{lab_rel} token={token}')
+        # Повторная подготовка: узлы, на которых метка этой подготовки на
+        # месте, не трогаем (работа студента на них сохраняется) — настраиваются
+        # только сброшенные (wipe). Все на месте — делать нечего
+        rec = await loop.run_in_executor(None, load_prep, lab_rel)
+        again = bool(rec and rec['token'] == token and rec['nodes'])
+        if again:
+            for node in rec['nodes']:
+                if node not in ostype:
+                    continue
+                ok, raw = await ctx.has_marker(node, token)
+                log('prep marker', f'{node}: ok={ok} answer={str(raw)[:300]!r}')
+                if ok is None:
+                    return await reply(f'Подготовка не выполнена: узел {node} не отвечает. Возможно, он ещё '
+                                       'загружается — подождите и нажмите «Подготовить заново» снова.',
+                                       'err', lab_rel)
+                if ok:
+                    ctx.skip.add(node)
+            if ctx.skip >= set(rec['nodes']):
+                return await reply('Лаба уже подготовлена, сброшенных узлов нет — ничего не меняли. '
+                                   'Выполните задание и нажмите «Проверить».', 'ok', lab_rel)
         try:
             result = prepare(ctx)
             if inspect.isawaitable(result):
@@ -1897,12 +1918,15 @@ async def run_prepare(request, fmt):
             detail = str(e.detail).rstrip('. ')
             return await reply(f'Подготовка не выполнена: узел {e.node}, шаг «{e.step}»: {detail}. {hint}',
                                'err', lab_rel)
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, save_prep, lab_rel, token, ctx.touched,
+        # В записи — все подготовленные узлы: заново настроенные и пропущенные
+        prepared = ctx.touched + sorted(n for n in ctx.skip if n not in ctx.touched)
+        await loop.run_in_executor(None, save_prep, lab_rel, token, prepared,
                                    labprep.variant_items(v))
         nodes = ', '.join(ctx.touched) or 'настраивать было нечего'
+        kept = f' Узлы {", ".join(sorted(ctx.skip))} не сбрасывались и не менялись.' if ctx.skip else ''
+        what = 'заново подготовлены сброшенные узлы' if again else 'подготовлены узлы'
         about_variant = ' Ваш вариант — в блоке лабы ниже.' if (v or labprep.task_text(module, v)) else ''
-        return await reply(f'Лаба подготовлена (узлы: {nodes}).{about_variant} '
+        return await reply(f'Лаба: {what}: {nodes}.{kept}{about_variant} '
                            'Выполните задание и нажмите «Проверить».', 'ok', lab_rel)
     except Exception as e:
         log('lab prepare err', traceback.format_exc())

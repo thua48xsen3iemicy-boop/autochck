@@ -60,6 +60,8 @@ def switch_ports(brief):
 
 
 async def prepare(ctx):
+    if ctx.skipped(SWITCH):
+        return      # коммутатор уже подготовлен (метка на месте) — не трогаем
     ports = switch_ports(await ctx.cisco_show(SWITCH, 'show ip interface brief'))
     if TRUNK_PORT not in ports:
         raise PrepareError(SWITCH, 'список портов',

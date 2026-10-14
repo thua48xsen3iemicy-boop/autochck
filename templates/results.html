@@ -150,7 +150,7 @@
 {% macro variant_block(p) %}
     {% if p %}
     <div class="variant">
-      <div class="variant-title">Ваш вариант
+      <div class="variant-title">{{ 'Ваш вариант' if p.variant or p.task else 'Подготовка лабы' }}
         {% if p.prep %}<span class="ts">подготовлена {{ p.prep }}</span>{% else %}<span class="ts warn">лаба ещё не подготовлена</span>{% endif %}
         {% if p.stale %}<span class="ts warn">вариант изменился — подготовьте лабу заново</span>{% endif %}
       </div>

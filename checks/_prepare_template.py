@@ -8,7 +8,10 @@ description лабы маркеры autocheck:on и prepare:on. Тогда у с
 подготовленный узел потом вайпнули (пропала метка подготовки) — студенту
 предлагается подготовить лабу заново. Попытка try:N при этом не тратится.
 
-Подготавливать пока можно только Linux-узлы.
+Подготавливать можно Linux-узлы (через qemu-guest-agent) и Cisco IOL,
+vIOS, vIOS-L2 (конфиг через консоль, см. пример с R1 ниже). Пока идёт
+подготовка, студенту нельзя работать в консолях узлов: строки конфига Cisco
+сверяются с running-config, и вмешательство в консоль прерывает подготовку.
 
 Вариант студента (VARIANT, variant(v)) один и тот же при каждой подготовке
 и проверке, у разных студентов — разный. Студент видит его на своей
@@ -32,7 +35,19 @@ description лабы маркеры autocheck:on и prepare:on. Тогда у с
     await ctx.mkdir('узел', '/путь')
     await ctx.write_file('узел', '/путь', 'текст', mode=0o644)
     await ctx.shell('узел', 'любая команда sh')
-Шаг, вернувший не 0, останавливает подготовку и показывается студенту.
+    await ctx.cisco_config('узел', '''строки конфига''', reload=False, expect=())
+Шаг, вернувший не 0 (на Cisco — ответ IOS «% ...»), останавливает подготовку
+и показывается студенту.
+
+Cisco: строки уходят по одной в configure terminal (end и conf t писать не
+нужно). После отправки строки hostname и ip address (и строки из expect)
+сверяются с running-config. В конце подготовки на каждом Cisco-узле —
+write memory, метка подготовки (alias exec prep-…) и очистка истории
+консоли, чтобы студент не видел команд подготовки в show history;
+reload=True — ещё и перезагрузка узла. Команды с вопросами (crypto key
+generate rsa без modulus и т. п.) не поддерживаются, banner — одной строкой
+(banner motd #текст#). Если на enable стоит пароль, он берётся из маркера
+cisco_pass:ПАРОЛЬ в описании лабы, как и при проверке.
 
 В check(ctx) вариант доступен как ctx.v — так проверка знает, какие адреса
 должны быть у этого студента.
@@ -67,6 +82,14 @@ async def prepare(ctx):
     await ctx.write_file('SRV1', f'/home/{v["site_user"]}/site/index.html',
                          f'<h1>{v["site_user"]}</h1>\n')
     await ctx.shell('SRV1', f'id {v["site_user"]} >/dev/null 2>&1 || useradd -m {v["site_user"]}')
+
+    # Маршрутизатор Cisco (IOL/vIOS): шлюз сети LAN
+    await ctx.cisco_config('R1', f'''
+        hostname R1
+        interface e0/0
+         ip address {v['gw'].ip} {v['lan'].mask}
+         no shutdown
+    ''')
 
 
 async def check(ctx):

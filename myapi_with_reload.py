@@ -1409,7 +1409,8 @@ async def run_lab_checks(ctx):
 ############################################################ LAB PREPARE
 # Лаба с маркером prepare:on в description сначала готовится: кнопка
 # «Подготовить лабу» (/ping?prepare=1) выполняет prepare(ctx) из файла лабы
-# в /pnet/checks на запущенных узлах (только Linux) и ставит на каждый
+# в /pnet/checks на запущенных узлах (Linux — через qemu-guest-agent, Cisco
+# IOL/vIOS — конфиг через консоль) и ставит на каждый
 # настроенный узел метку с отпечатком варианта. Проверка такой лабы идёт,
 # только если подготовка была и метки на месте (узел не вайпнули). Вариант
 # студента и готовые действия — labprep.py, пример — checks/_prepare_template.py.
@@ -1510,6 +1511,212 @@ async def qga_exec_full(command, socket_path):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, qga_exec_full_sync, command, socket_path)
 
+# Подключение к консоли узла (в тестах подменяется эмулятором)
+CONSOLE_SPAWN = 'telnet 127.0.0.1 {port}'
+
+class CiscoConsole:
+    """Сессия консоли Cisco (IOL, vIOS) для подготовки лаб: вход (как в
+    проверке, node_ciscologin), конфиг построчно с разбором ответа IOS,
+    write memory, очистка истории, reload. Синхронная (pexpect) — из async
+    кода через AsyncConsole. Ошибки обмена — labprep.ConsoleError."""
+    CFG_PROMPT = r'\(config[^\r\n]*\)#'
+    ANY_EXEC = r'[\r\n]([\w.\-]+)#'
+
+    def __init__(self, port, secret=None):
+        self.port, self.secret = port, secret
+        self.h = None
+        self.prompt = None
+
+    def open(self):
+        """None — вошли в privileged exec, иначе текст ошибки для студента."""
+        self.h = pexpect.spawnu(CONSOLE_SPAWN.format(port=self.port), maxread=100000)
+        if node_ciscologin(self.h, self.secret) is not True:
+            return ('не удалось войти в консоль: узел ещё загружается, или на enable '
+                    'задан пароль, которого нет в cisco_pass: описания лабы')
+        self._prompt_from_line()
+        self.exec('terminal length 0')
+        return None
+
+    def _drain(self):
+        while True:
+            try:
+                self.h.read_nonblocking(65536, timeout=0.2)
+            except pexpect.TIMEOUT:
+                return
+            except pexpect.EOF:
+                raise labprep.ConsoleError('консоль закрылась')
+
+    def _expect(self, patterns, timeout, what):
+        try:
+            return self.h.expect(patterns, timeout=timeout)
+        except pexpect.TIMEOUT:
+            raise labprep.ConsoleError(f'нет ответа консоли ({what})')
+        except pexpect.EOF:
+            raise labprep.ConsoleError('консоль закрылась')
+
+    def _prompt_from_line(self):
+        self._drain()
+        self.h.sendline('')
+        self._expect(self.ANY_EXEC, cisexpctimeout, 'приглашение')
+        self.prompt = self.h.match.group(1)
+
+    @staticmethod
+    def _ios_error(text):
+        """Первая строка-ошибка IOS ('% Invalid input…'); предупреждения и
+        syslog (%LINK-3-…) ошибками не считаются."""
+        for line in text.replace('\r', '').split('\n'):
+            line = line.strip()
+            if line.startswith('% ') and 'warning' not in line.lower():
+                return line
+        return None
+
+    def exec(self, cmd, timeout=None):
+        self._drain()
+        self.h.sendline(cmd)
+        self._expect(r'[\r\n]' + re.escape(self.prompt) + '#', timeout or cislongtimeout, cmd)
+        lines = self.h.before.replace('\r', '').split('\n')
+        if lines and cmd.strip() and cmd.strip() in lines[0]:
+            lines = lines[1:]          # эхо команды
+        return '\n'.join(lines).strip('\n')
+
+    def configure(self, lines):
+        """Строки по одной в configure terminal. (строка, ответ IOS) при первой
+        ошибке, иначе None. На время отправки — no logging console, чтобы
+        сообщения не мешали ловить приглашения."""
+        self._drain()
+        self.h.sendline('configure terminal')
+        self._expect(self.CFG_PROMPT, cisexpctimeout, 'configure terminal')
+        quiet = not any('logging console' in l for l in lines)
+        seq = (['no logging console'] if quiet else []) + list(lines) + (['logging console'] if quiet else [])
+        for line in seq:
+            self.h.sendline(line)
+            try:
+                i = self.h.expect([self.CFG_PROMPT, self.ANY_EXEC], timeout=cisexpctimeout)
+            except pexpect.TIMEOUT:
+                self._leave_config()
+                return line, 'устройство не вернуло приглашение (интерактивная команда?)'
+            except pexpect.EOF:
+                raise labprep.ConsoleError('консоль закрылась')
+            err = self._ios_error(self.h.before)
+            if err:
+                self._leave_config()
+                return line, err
+            if i == 1:
+                # строка вывела из режима конфигурации (exit на верхнем уровне)
+                self.h.sendline('configure terminal')
+                self._expect(self.CFG_PROMPT, cisexpctimeout, 'configure terminal')
+        self._leave_config()
+        return None
+
+    def _leave_config(self):
+        self.h.sendline('end')
+        self._expect(self.ANY_EXEC, cisexpctimeout, 'end')
+        self.prompt = self.h.match.group(1)   # hostname мог смениться
+
+    def save(self):
+        out = self.exec('write memory', timeout=120)
+        err = self._ios_error(out)
+        return f'write memory: {err}' if err else None
+
+    def clear_history(self):
+        # history size 0 сбрасывает историю команд консольной линии
+        self.exec('terminal history size 0')
+        self.exec('terminal history size 10')
+
+    def reload(self):
+        self._drain()
+        self.h.sendline('reload')
+        i = self._expect([r'Save\?|\[yes/no\]', r'\[confirm\]'], cisexpctimeout, 'reload')
+        if i == 0:
+            self.h.sendline('yes')
+            self._expect(r'\[confirm\]', cislongtimeout, 'reload')
+        self.h.sendline('')
+        time.sleep(1)
+
+    def close(self):
+        if self.h is not None:
+            node_ciscoquit(self.h)
+            self.h = None
+
+class AsyncConsole:
+    """CiscoConsole для labprep.PrepareContext: каждый шаг — в executor."""
+    def __init__(self, console):
+        self._c = console
+
+    async def _call(self, fn, *args):
+        loop = asyncio.get_event_loop()
+        try:
+            return await loop.run_in_executor(None, fn, *args)
+        except (pexpect.ExceptionPexpect, OSError) as e:
+            raise labprep.ConsoleError(f'консоль не ответила ({type(e).__name__})')
+
+    async def exec(self, cmd):
+        return await self._call(self._c.exec, cmd)
+
+    async def configure(self, lines):
+        return await self._call(self._c.configure, lines)
+
+    async def save(self):
+        return await self._call(self._c.save)
+
+    async def clear_history(self):
+        return await self._call(self._c.clear_history)
+
+    async def reload(self):
+        return await self._call(self._c.reload)
+
+    async def close(self):
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, self._c.close)
+        except Exception as e:
+            log('console close err', e)
+
+def node_console_ports(ostype, paths):
+    """{узел: порт консоли} Cisco-узлов лабы: IOL — по процессу iol_wrapper,
+    qemu (vIOS) — по каталогу узла + 30000, как в проверке L2."""
+    ports = {}
+    cisco = {n: t for n, t in ostype.items() if labprep.OS_FAMILY.get(t) == 'cisco'}
+    iol = get_iol_console_ports() if 'iol' in cisco.values() else {}
+    for node, t in cisco.items():
+        if t == 'iol':
+            if node in iol:
+                ports[node] = iol[node]
+        elif node in paths:
+            try:
+                ports[node] = int(paths[node].split('/')[1]) + 30000
+            except (IndexError, ValueError):
+                log('console port err', f'{node} {paths[node]}')
+    return ports
+
+def make_node_fns(ostype, lab_file):
+    """(exec_fn, console_fn) для labprep.PrepareContext: команды Linux через
+    qemu-guest-agent и сессии консоли Cisco-узлов лабы."""
+    paths = qga_paths()
+    ports = node_console_ports(ostype, paths)
+    secret = parse_cisco_pass(lab_file)
+
+    async def exec_fn(node, cmd):
+        if node not in paths:
+            return None, '', 'не найден процесс узла'
+        return await qga_exec_full(cmd, paths[node])
+
+    async def console_fn(node):
+        if node not in ports:
+            return 'не найден порт консоли узла (узел запущен?)'
+        console = CiscoConsole(ports[node], secret)
+        loop = asyncio.get_event_loop()
+        try:
+            err = await loop.run_in_executor(None, console.open)
+        except (pexpect.ExceptionPexpect, OSError, labprep.ConsoleError) as e:
+            err = f'консоль не отвечает ({e})'
+        if err:
+            await loop.run_in_executor(None, console.close)
+            return err
+        return AsyncConsole(console)
+
+    return exec_fn, console_fn
+
 def _preps_conn(db_path):
     conn = sqlite3.connect(db_path)
     conn.execute("""CREATE TABLE IF NOT EXISTS preps (
@@ -1600,17 +1807,18 @@ async def prep_gate(lab_rel):
     ostype, _diag = find_uuid_in_file_and_ps(lab_file)
     if not isinstance(ostype, dict) or not rec['nodes']:
         return None
-    paths = qga_paths()
+    exec_fn, console_fn = make_node_fns(ostype, lab_file)
+    ctx = labprep.PrepareContext(None, ostype, exec_fn, username, stem, console_fn=console_fn)
     bad = []
     for node in rec['nodes']:
-        if node not in paths:
+        if node not in ostype:
             bad.append(node)
             continue
-        rc, out, err = await qga_exec_full(labprep.MARKER_READ_CMD, paths[node])
-        if rc is None:
+        tokens = await ctx.read_marker(node)
+        if tokens is None:
             return (f'Проверка не выполнена: узел {node} не отвечает. Возможно, он ещё '
                     'загружается — подождите и нажмите «Проверить» снова.')
-        if out.strip() != token:
+        if token not in tokens:
             bad.append(node)
     if bad:
         log('prep markers missing', bad)
@@ -1661,14 +1869,8 @@ async def run_prepare(request, fmt):
         if not isinstance(ostype, dict):
             return await reply(nodes_run_message(diag, 'Подготовка', 'Подготовить лабу'), 'warn', lab_rel)
         v, token = lab_variant(module, stem)
-        paths = qga_paths()
-
-        async def exec_fn(node, cmd):
-            if node not in paths:
-                return None, '', 'не найден процесс узла'
-            return await qga_exec_full(cmd, paths[node])
-
-        ctx = labprep.PrepareContext(v, ostype, exec_fn, username, stem)
+        exec_fn, console_fn = make_node_fns(ostype, lab_file)
+        ctx = labprep.PrepareContext(v, ostype, exec_fn, username, stem, console_fn=console_fn)
         log('lab prepare', f'{lab_rel} token={token}')
         try:
             result = prepare(ctx)
@@ -1678,10 +1880,11 @@ async def run_prepare(request, fmt):
                 await ctx.write_marker(node, token)
         except labprep.PrepareError as e:
             log('lab prepare failed', str(e))
-            hint = ('Это ошибка в файле подготовки лабы — сообщите преподавателю.' if e.teacher else
-                    'Если узел ещё загружается — подождите и нажмите «Подготовить лабу» снова; '
-                    'если ошибка повторяется — сообщите преподавателю.')
-            return await reply(f'Подготовка не выполнена: узел {e.node}, шаг «{e.step}»: {e.detail}. {hint}',
+            hint = e.hint or ('Это ошибка в файле подготовки лабы — сообщите преподавателю.' if e.teacher else
+                              'Если узел ещё загружается — подождите и нажмите «Подготовить лабу» снова; '
+                              'если ошибка повторяется — сообщите преподавателю.')
+            detail = str(e.detail).rstrip('. ')
+            return await reply(f'Подготовка не выполнена: узел {e.node}, шаг «{e.step}»: {detail}. {hint}',
                                'err', lab_rel)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, save_prep, lab_rel, token, ctx.touched,
@@ -1999,17 +2202,18 @@ def node_ciscologin(handler, secret=None):
             node_ciscoquit(handler)
             return False
         handler.sendline('\r\n')
+        # Приглашение по умолчанию: Switch> у коммутатора, Router> у роутера
         try:
-            handler.expect('Switch>', timeout = cisexpctimeout)
+            handler.expect(r'[\w.\-]+>', timeout = cisexpctimeout)
         except:
-            print('ERROR: error waiting for "Switch> prompt.')
+            print('ERROR: error waiting for "> prompt.')
             node_ciscoquit(handler)
             return False
         handler.sendline('enable')
         try:
-            handler.expect('Switch#', timeout = cisexpctimeout)
+            handler.expect(r'[\w.\-]+#', timeout = cisexpctimeout)
         except:
-            print('ERROR: error waiting for "Switch# prompt.')
+            print('ERROR: error waiting for "# prompt.')
             node_ciscoquit(handler)
             return False
         return True

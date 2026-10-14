@@ -154,7 +154,7 @@
     {% if confirm %}
     <div class="actions">
       <a class="primary" href="ping?confirm=1" onclick="startRun(this)">Запустить проверку</a>
-      <a href="results">Отмена</a>
+      <a href="ping">Отмена</a>
     </div>
     {% endif %}
   </div>
@@ -241,10 +241,11 @@
   {% endfor %}
 </div>
 <script>
-  // После проверки адрес ping?run=1 меняем на results, чтобы обновление
-  // страницы (F5) не запускало проверку повторно
+  // После проверки адрес ping?run=1 меняем на простой ping (он только
+  // показывает страницу), чтобы обновление (F5) не запускало проверку
+  // повторно. Не results: снаружи он может быть недоступен (404)
   if (/[?&](run|confirm)=/.test(location.search) && window.history.replaceState) {
-    history.replaceState(null, '', 'results');
+    history.replaceState(null, '', 'ping');
   }
 
   // Защита от повторных кликов, пока идёт проверка. Сообщение об ожидании

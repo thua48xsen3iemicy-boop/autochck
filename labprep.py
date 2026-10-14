@@ -424,15 +424,24 @@ def _norm_ws(text):
     return re.sub(r'[ \t]+', ' ', text)
 
 
-CISCO_MARKER_READ = 'show running-config | include ^alias exec prep-'
+# Метка подготовки на Cisco — alias exec prep<8 hex отпечатка> в конфиге:
+# короткое имя из букв и цифр, без якорей в фильтре — меньше зависимости от
+# правил конкретного IOS. Старый формат prep-<16 hex> тоже распознаётся
+# (чтобы удалить его при повторной подготовке).
+CISCO_MARKER_READ = 'show running-config | include alias exec prep'
+
+
+def cisco_marker_name(token):
+    return 'prep' + token[:8]
 
 
 def cisco_marker_line(token):
-    return f'alias exec prep-{token} show clock'
+    return f'alias exec {cisco_marker_name(token)} show clock'
 
 
-def cisco_marker_tokens(output):
-    return re.findall(r'alias exec prep-([0-9a-f]+)', output or '')
+def cisco_marker_names(output):
+    """Имена alias-меток подготовки в выводе running-config."""
+    return re.findall(r'alias exec (prep-?[0-9a-f]+)\b', (output or '').lower())
 
 
 class PrepareContext:
@@ -594,10 +603,18 @@ class PrepareContext:
         step = 'сохранение конфигурации'
         sess = await self._open_console(node, step)
         try:
-            old = [t for t in cisco_marker_tokens(await sess.exec(CISCO_MARKER_READ)) if t != token]
-            bad = await sess.configure([f'no alias exec prep-{t}' for t in old] + [cisco_marker_line(token)])
+            name = cisco_marker_name(token)
+            old = [n for n in cisco_marker_names(await sess.exec(CISCO_MARKER_READ)) if n != name]
+            bad = await sess.configure([f'no alias exec {n}' for n in old] + [cisco_marker_line(token)])
             if bad:
                 raise PrepareError(node, step, f'{bad[0]}: {bad[1]}')
+            # Метку сразу читаем обратно: если IOS её не принял (молча), это
+            # должно быть видно сейчас, а не «сбросом узла» при проверке
+            got = await sess.exec(CISCO_MARKER_READ)
+            if name not in cisco_marker_names(got):
+                raise PrepareError(node, 'метка подготовки',
+                                   f'строка «{cisco_marker_line(token)}» не появилась в running-config; '
+                                   f'ответ: {" ".join(got.split())[:200] or "пусто"}', teacher=True)
             err = await sess.save()
             if err:
                 raise PrepareError(node, step, err)
@@ -609,24 +626,25 @@ class PrepareContext:
         finally:
             await sess.close()
 
-    async def read_marker(self, node):
-        """Отпечатки подготовки на узле: список (пустой — метки нет) или None,
-        если узел не ответил."""
+    async def has_marker(self, node, token):
+        """(есть ли на узле метка этой подготовки, сырой ответ узла).
+        Первый элемент None — узел не ответил."""
         fam = OS_FAMILY.get(self.ostype.get(node))
         if fam == 'linux':
-            rc, out, _err = await self._exec(node, MARKER_READ_CMD)
-            return None if rc is None else [out.strip()] if out.strip() else []
+            rc, out, err = await self._exec(node, MARKER_READ_CMD)
+            return (None if rc is None else out.strip() == token), (out if rc is not None else err)
         if fam == 'cisco' and self._console is not None:
             sess = await self._console(node)
             if isinstance(sess, str):
-                return None
+                return None, sess
             try:
-                return cisco_marker_tokens(await sess.exec(CISCO_MARKER_READ))
-            except ConsoleError:
-                return None
+                out = await sess.exec(CISCO_MARKER_READ)
+                return cisco_marker_name(token) in cisco_marker_names(out), out
+            except ConsoleError as e:
+                return None, str(e)
             finally:
                 await sess.close()
-        return []
+        return False, 'узел этого типа не поддерживается'
 
 
 MARKER_READ_CMD = f'cat {MARKER_PATH} 2>/dev/null || true'

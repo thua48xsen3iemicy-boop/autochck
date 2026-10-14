@@ -1824,11 +1824,12 @@ async def prep_gate(lab_rel):
         if node not in ostype:
             bad.append(node)
             continue
-        tokens = await ctx.read_marker(node)
-        if tokens is None:
+        ok, raw = await ctx.has_marker(node, token)
+        log('prep marker', f'{node}: ok={ok} answer={str(raw)[:300]!r}')
+        if ok is None:
             return (f'Проверка не выполнена: узел {node} не отвечает. Возможно, он ещё '
                     'загружается — подождите и нажмите «Проверить» снова.')
-        if token not in tokens:
+        if not ok:
             bad.append(node)
     if bad:
         log('prep markers missing', bad)
@@ -3279,12 +3280,14 @@ async def render_dashboard(request: Request, notice=None, status=None, current_l
     # Кнопка «Подготовить лабу» — только пока открыта лаба с prepare:on; эта
     # лаба (с вариантом студента) показывается и выбирается, даже если её
     # ещё не проверяли
-    prep_lab = open_rel = None
+    prep_lab = open_rel = prep_state = None
     if labprep is not None:
         open_rel = await loop.run_in_executor(None, open_lab_path)
         if open_rel and parse_desc_flag(LABS_ROOT + open_rel, 'prepare'):
             prep_lab = os.path.basename(open_rel).rsplit('.', 1)[0]
             current_lab = current_lab or open_rel
+            # Состояние подготовки открытой лабы — для текста у кнопки
+            prep_state = await loop.run_in_executor(None, lab_prep_info, open_rel)
         else:
             open_rel = None
     labs = await loop.run_in_executor(None, load_dashboard, RESULT_DB_PATH,
@@ -3307,6 +3310,7 @@ async def render_dashboard(request: Request, notice=None, status=None, current_l
         "status": status,
         "confirm": confirm,
         "prep_lab": prep_lab,
+        "prep_state": prep_state,
     })
 
 @app.get("/results", response_class=HTMLResponse)

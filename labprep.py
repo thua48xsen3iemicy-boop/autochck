@@ -471,6 +471,13 @@ class PrepareContext:
 
     ctx.username, ctx.lab_stem
 
+    Повторная подготовка («Подготовить заново») настраивает только узлы без
+    метки этой подготовки (сброшенные). Узлы с меткой пропускаются: на них
+    действия ничего не делают (cisco_show при этом выполняется — это чтение),
+    ctx.skipped(узел) — True. Если prepare() читает состояние узла, чтобы
+    потом его сверить, пропускайте такой узел целиком:
+        if not ctx.skipped('Switch'): ...
+
     Любая неудача (команда не прошла, узел не отвечает, тип узла пока не
     поддерживается) останавливает подготовку: студент видит узел, шаг и
     хвост вывода. Действия можно повторять: повторная подготовка безопасна.
@@ -485,6 +492,11 @@ class PrepareContext:
         self._console = console_fn   # async (node) -> сессия консоли | str-ошибка
         self.touched = []            # узлы, на которых что-то настраивали
         self.reload_nodes = set()    # Cisco-узлы, которые перезагрузить в конце
+        self.skip = set()            # узлы с меткой подготовки — не трогать
+
+    def skipped(self, node):
+        """Узел уже подготовлен (метка на месте) — повторно не настраивается."""
+        return node in self.skip
 
     def _family(self, node, step, need):
         if node not in self.ostype:
@@ -504,6 +516,8 @@ class PrepareContext:
 
     async def _run(self, node, step, cmd):
         self._family(node, step, 'linux')
+        if node in self.skip:
+            return ''
         rc, out, err = await self._exec(node, cmd)
         if rc is None:
             raise PrepareError(node, step, err or 'узел не отвечает (возможно, ещё загружается)')
@@ -556,6 +570,9 @@ class PrepareContext:
 
     # ------------------------------------------------------------ Cisco
     async def cisco_config(self, node, text, reload=False, expect=()):
+        if node in self.skip:
+            self._family(node, 'конфигурация', 'cisco')
+            return
         lines = cisco_config_lines(text)
         step = 'конфигурация'
         sess = await self._open_console(node, step)

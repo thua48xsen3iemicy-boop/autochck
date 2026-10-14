@@ -1323,9 +1323,17 @@ class LabCheckContext:
     ctx.answer                  — словарь ответа /ping (отладка, JSON админу)
     ctx.v                       — вариант студента (VARIANT в файле лабы,
                                   см. labprep.py); None, если варианта нет
+    ctx.penalty(name, count, points)
+                                — штраф: count ошибок по points баллов
+                                  вычитается из итога (в max не входит) —
+                                  ошибки доп. проверки бьют по всей оценке
+    await ctx.cisco_show(node, cmd | [cmd, ...])
+                                — вывод show-команд(ы) Cisco-узла через консоль
+                                  (одна сессия на список); 'NONE' (или список
+                                  'NONE'), если консоль недоступна
     """
     def __init__(self, lab_path, dict_of_name_and_ostype, dict_of_name_and_path,
-                 add_check, errors_list, answer):
+                 add_check, errors_list, answer, add_penalty=None):
         self.lab_path = lab_path
         self.ostype = dict(dict_of_name_and_ostype)
         self.nodes = sorted(self.ostype)
@@ -1335,6 +1343,8 @@ class LabCheckContext:
         self._errors = errors_list
         self.added = set()  # имена пунктов, добавленных файлом проверок
         self.v = None
+        self._add_penalty = add_penalty
+        self._console_fn = None
 
     async def run(self, node, cmd):
         qga = QGA_OSTYPES.get(self.ostype.get(node))
@@ -1355,6 +1365,34 @@ class LabCheckContext:
     def add_check(self, name, score, maxv):
         self.added.add(name)
         self._add_check(name, score, maxv)
+
+    def penalty(self, name, count, points):
+        count = int(count)
+        if count > 0 and self._add_penalty is not None:
+            self.added.add(name)
+            self._add_penalty(name, count, count * int(points))
+
+    async def cisco_show(self, node, cmds):
+        single = isinstance(cmds, str)
+        cmds = [cmds] if single else list(cmds)
+        fail = 'NONE' if single else ['NONE'] * len(cmds)
+        if labprep is None or labprep.OS_FAMILY.get(self.ostype.get(node)) != 'cisco':
+            log('lab check cisco_show: unsupported node', f'{node} {self.ostype.get(node)}')
+            return fail
+        if self._console_fn is None:
+            _exec, self._console_fn = make_node_fns(self.ostype, self.lab_path)
+        sess = await self._console_fn(node)
+        if isinstance(sess, str):
+            log('lab check cisco_show: console', f'{node}: {sess}')
+            return fail
+        try:
+            outs = [await sess.exec(c) for c in cmds]
+        except labprep.ConsoleError as e:
+            log('lab check cisco_show err', f'{node}: {e}')
+            return fail
+        finally:
+            await sess.close()
+        return outs[0] if single else outs
 
 def lab_checks_file(lab_path):
     stem = os.path.basename(lab_path).rsplit('.', 1)[0]
@@ -4610,9 +4648,12 @@ async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(
 
                 # Доп. проверки конкретной лабы из /pnet/checks/<лаба>.py
                 main_errors_count = len(errors['errors_noty'])
+                def add_lab_penalty(name, count, points):
+                    penalties[name] = {"count": count, "points": points}
+                    forweb[name] = f'штраф -{points}'
                 lab_ctx = LabCheckContext(
                     lab_path, dict_of_name_and_ostype, dict_of_name_and_path,
-                    add_check, errors['errors_noty'], answer)
+                    add_check, errors['errors_noty'], answer, add_lab_penalty)
                 keep, failed = await run_lab_checks(lab_ctx)
                 if failed:
                     # Файл проверок упал: результат не засчитывается — ноль

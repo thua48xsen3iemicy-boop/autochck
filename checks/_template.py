@@ -11,6 +11,10 @@
     ctx.add_check('Название', score, max)  # пункт оценки, score клампится в 0..max
     ctx.nodes, ctx.ostype                  # узлы лабы и их ОС ('linux', 'win', ...)
     ctx.lab_path, ctx.answer               # путь к .unl; словарь ответа (отладка)
+    ctx.penalty('Название', N, баллов)     # штраф: N ошибок по «баллов» из итога
+                                           # (в max не входит — бьёт по всей оценке)
+    out = await ctx.cisco_show('SW', 'show vlan brief')        # Cisco через консоль
+    a, b = await ctx.cisco_show('SW', ['show run', 'show vlan brief'])  # одна сессия
 
 Команды выполняются через qemu-guest-agent: только Linux (sh -c) и Windows
 (cmd /c) узлы. Исключение в файле (синтаксис, check()) не роняет сервис, но

@@ -32,6 +32,16 @@
     background: var(--accent); color: #fff; font-weight: 600; }
   .runbtn.busy { opacity: .6; pointer-events: none; }
   .runhint { color: var(--muted); font-size: 13px; }
+  .runbtn.prep { background: var(--card); color: var(--accent); border: 1px solid var(--accent); }
+  .notice.ok { background: #e6f6ec; border-color: #b6e3c6; color: #135c33; }
+  .variant { margin: 4px 0 14px; background: #f4f8ff; border: 1px solid #cfe0fb; border-radius: 10px; padding: 10px 14px; }
+  .variant-title { font-weight: 600; margin-bottom: 6px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .variant-title .ts { font-weight: 400; }
+  .variant table td { padding: 3px 12px 3px 0; font-size: 14px; }
+  .variant table td:first-child { color: var(--muted); }
+  .variant table td:last-child { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .variant .task { margin-top: 8px; white-space: pre-line; }
+  .variant .warn { color: var(--warn); }
 
   .sortbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
   .sortlabel { color: var(--muted); font-size: 13px; margin-right: 2px; }
@@ -136,6 +146,22 @@
     </div>
     {% endif %}
 {% endmacro %}
+{# Вариант студента и состояние подготовки лабы с prepare:on #}
+{% macro variant_block(p) %}
+    {% if p %}
+    <div class="variant">
+      <div class="variant-title">Ваш вариант
+        {% if p.prep %}<span class="ts">подготовлена {{ p.prep }}</span>{% else %}<span class="ts warn">лаба ещё не подготовлена</span>{% endif %}
+        {% if p.stale %}<span class="ts warn">вариант изменился — подготовьте лабу заново</span>{% endif %}
+      </div>
+      {% if p.error %}<div class="warn">{{ p.error }}</div>{% endif %}
+      {% if p.variant %}
+      <table>{% for k, val in p.variant %}<tr><td>{{ k }}</td><td>{{ val }}</td></tr>{% endfor %}</table>
+      {% endif %}
+      {% if p.task %}<div class="task">{{ p.task }}</div>{% endif %}
+    </div>
+    {% endif %}
+{% endmacro %}
 {# По умолчанию открыта первая (самая свежая / текущая) лаба, даже если бэкенд не прислал sel_index #}
 {% set sel_index = sel_index if sel_index is defined else 0 %}
 <div class="wrap">
@@ -145,15 +171,19 @@
   </header>
 
   <div class="runbar">
-    <a class="runbtn" href="ping?run=1" onclick="startRun(this)">Проверить</a>
-    <span class="runhint" id="runhint">Кнопка проверит лабу, открытую в PNETLab. Сначала запустите все её узлы и дождитесь их загрузки.</span>
+    <a class="runbtn" href="ping?run=1" data-label="Проверить" onclick="startRun(this, 'Проверка идёт…')">Проверить</a>
+    {% if prep_lab %}
+    <a class="runbtn prep" href="ping?prepare=1" data-label="Подготовить лабу"
+       onclick="startRun(this, 'Подготовка идёт…')">Подготовить лабу</a>
+    {% endif %}
+    <span class="runhint" id="runhint">{% if prep_lab %}Открытая лаба {{ prep_lab }} требует подготовки: запустите все её узлы, дождитесь загрузки и нажмите «Подготовить лабу», затем выполните задание и нажмите «Проверить».{% else %}Кнопка проверит лабу, открытую в PNETLab. Сначала запустите все её узлы и дождитесь их загрузки.{% endif %}</span>
   </div>
 
   {% if notice %}
-  <div class="notice{% if status == 'err' %} err{% endif %}">{{ notice }}
+  <div class="notice{% if status == 'err' %} err{% elif status == 'ok' %} ok{% endif %}">{{ notice }}
     {% if confirm %}
     <div class="actions">
-      <a class="primary" href="ping?confirm=1" onclick="startRun(this)">Запустить проверку</a>
+      <a class="primary" href="ping?confirm=1" data-label="Запустить проверку" onclick="startRun(this, 'Проверка идёт…')">Запустить проверку</a>
       <a href="ping">Отмена</a>
     </div>
     {% endif %}
@@ -205,7 +235,8 @@
       <h2>{{ lab.lab_path }}</h2>
       <div class="badges"><span class="badge done">Не начата</span></div>
     </div>
-    <p class="empty">Проверок этой лабы ещё не было. Откройте её и нажмите «Проверить».</p>
+    {{ variant_block(lab.prep) }}
+    <p class="empty">Проверок этой лабы ещё не было. Откройте её и нажмите «{{ 'Подготовить лабу' if lab.prep and not lab.prep.prep else 'Проверить' }}».</p>
     {% else %}
     <div class="lab-head">
       <h2>{{ lab.lab_path }}</h2>
@@ -217,6 +248,7 @@
       </div>
     </div>
 
+    {{ variant_block(lab.prep) }}
     {{ detail(latest, labels) }}
 
     {% if lab.attempts|length > 1 %}
@@ -244,7 +276,7 @@
   // После проверки адрес ping?run=1 меняем на простой ping (он только
   // показывает страницу), чтобы обновление (F5) не запускало проверку
   // повторно. Не results: снаружи он может быть недоступен (404)
-  if (/[?&](run|confirm)=/.test(location.search) && window.history.replaceState) {
+  if (/[?&](run|confirm|prepare)=/.test(location.search) && window.history.replaceState) {
     history.replaceState(null, '', 'ping');
   }
 
@@ -252,19 +284,22 @@
   // показывается только во время проверки: после ответа страница
   // перерисовывается и кнопка снова «Проверить»
   var RUN_HINT = document.getElementById('runhint').textContent;
-  function startRun(a) {
-    var btns = document.querySelectorAll('.runbtn, .notice .actions a.primary');
+  var RUN_BTNS = '.runbtn, .notice .actions a.primary';
+  function startRun(a, busyText) {
+    var btns = document.querySelectorAll(RUN_BTNS);
     for (var i = 0; i < btns.length; i++) { btns[i].classList.add('busy'); }
-    a.textContent = 'Проверка идёт…';
-    document.getElementById('runhint').textContent = 'Идёт проверка, это может занять пару минут. Не закрывайте страницу.';
+    a.textContent = busyText;
+    document.getElementById('runhint').textContent = busyText.replace('…', '') +
+      ', это может занять пару минут. Не закрывайте страницу.';
   }
-  // Возврат на страницу кнопкой «Назад» (из кеша браузера) — сбросить кнопку
+  // Возврат на страницу кнопкой «Назад» (из кеша браузера) — сбросить кнопки
   window.addEventListener('pageshow', function(e) {
     if (!e.persisted) return;
-    var b = document.querySelector('.runbtn');
-    if (b) { b.classList.remove('busy'); b.textContent = 'Проверить'; }
-    var c = document.querySelector('.notice .actions a.primary');
-    if (c) { c.classList.remove('busy'); c.textContent = 'Запустить проверку'; }
+    var btns = document.querySelectorAll(RUN_BTNS);
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].classList.remove('busy');
+      if (btns[i].dataset.label) btns[i].textContent = btns[i].dataset.label;
+    }
     document.getElementById('runhint').textContent = RUN_HINT;
   });
 

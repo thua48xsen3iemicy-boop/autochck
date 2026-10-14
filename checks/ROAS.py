@@ -11,6 +11,10 @@
   MGR1 Gi0/3, SALE1 Gi0/2, SALE2 Gi0/1.
 
 Подготовка (только Switch, Linux-узлы не трогаются):
+  - SSH для студента: логин cisco / пароль cisco, после входа сразу
+    привилегированный режим (privilege 15). Для ключа RSA IOS требует имя,
+    отличное от заводского, и домен: hostname SW1, ip domain-name lab.local.
+    Ключ генерируется, только если его ещё нет (иначе IOS задаёт вопрос);
   - Gi0/0 — транк dot1q (инкапсуляция задаётся явно до включения транка),
     в транке разрешён только VLAN 777;
   - VLAN 777 и его SVI 10.77.7.1/24 (адрес студент знает из задания);
@@ -19,6 +23,13 @@
     vIOS-L2 с 8, и с 16 портами.
 После отправки конфиг сверяется: строки транка и SVI — с running-config,
 состояние портов — с show ip interface brief.
+
+SSH старого IOS (vIOS-L2) умеет только ssh-rsa с SHA-1 и
+diffie-hellman-group14-sha1, которые в OpenSSH Debian 12 выключены по
+умолчанию. Подключение с RWAN:
+  ssh -o KexAlgorithms=+diffie-hellman-group14-sha1 \
+      -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+      cisco@10.77.7.1
 
 Доп. проверок у лабы в этом файле нет (только prepare) — проверяется
 обычными проверками автопроверки.
@@ -31,6 +42,9 @@ TRUNK_PORT = 'GigabitEthernet0/0'
 MGMT_VLAN = 777
 MGMT_IP = '10.77.7.1'
 MGMT_MASK = '255.255.255.0'
+HOSTNAME = 'SW1'
+DOMAIN = 'lab.local'
+SSH_USER, SSH_PASSWORD = 'cisco', 'cisco'
 
 _PORT_RE = re.compile(r'^((?:GigabitEthernet|FastEthernet|Ethernet)\d+(?:/\d+)+)\s+.*?\s(administratively down|up|down)\s+(up|down)\s*$')
 
@@ -52,8 +66,20 @@ async def prepare(ctx):
                            f'на коммутаторе нет порта {TRUNK_PORT} (найдено: {", ".join(ports) or "ничего"})',
                            teacher=True)
     others = [p for p in ports if p != TRUNK_PORT]
+    has_key = 'Key name' in await ctx.cisco_show(SWITCH, 'show crypto key mypubkey rsa')
 
     config = [
+        f'hostname {HOSTNAME}',
+        f'ip domain-name {DOMAIN}',
+        f'username {SSH_USER} privilege 15 secret {SSH_PASSWORD}',
+    ]
+    if not has_key:
+        config.append('crypto key generate rsa modulus 2048')
+    config += [
+        'ip ssh version 2',
+        'line vty 0 4',
+        ' login local',
+        ' transport input ssh',
         f'vlan {MGMT_VLAN}',
         f'interface {TRUNK_PORT}',
         ' switchport trunk encapsulation dot1q',
@@ -68,10 +94,18 @@ async def prepare(ctx):
         config += [f'interface {port}', ' shutdown']
 
     await ctx.cisco_config(SWITCH, '\n'.join(config), expect=[
+        f'username {SSH_USER} privilege 15',
+        'ip ssh version 2',
+        'login local',
+        'transport input ssh',
         'switchport trunk encapsulation dot1q',
         'switchport mode trunk',
         f'switchport trunk allowed vlan {MGMT_VLAN}',
     ])
+
+    ssh = await ctx.cisco_show(SWITCH, 'show ip ssh')
+    if 'SSH Enabled' not in ssh:
+        raise PrepareError(SWITCH, 'SSH', 'SSH не включился: ' + ' '.join(ssh.split())[:200], teacher=True)
 
     # Порты: все, кроме транка, выключены; транк не выключен
     state = switch_ports(await ctx.cisco_show(SWITCH, 'show ip interface brief'))

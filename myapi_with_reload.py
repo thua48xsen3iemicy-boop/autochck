@@ -1563,13 +1563,18 @@ class CiscoConsole:
         self._expect(self.ANY_EXEC, cisexpctimeout, 'приглашение')
         self.prompt = self.h.match.group(1)
 
-    @staticmethod
-    def _ios_error(text):
-        """Первая строка-ошибка IOS ('% Invalid input…'); предупреждения и
-        syslog (%LINK-3-…) ошибками не считаются."""
+    # Строки «% …», которые IOS печатает как информацию, а не ошибку
+    IOS_INFO = ('% Generating', '% The key modulus', '% Key pair was generated')
+
+    @classmethod
+    def _ios_error(cls, text):
+        """Первая строка-ошибка IOS ('% Invalid input…'); предупреждения,
+        информационные сообщения (IOS_INFO) и syslog (%LINK-3-…) ошибками не
+        считаются."""
         for line in text.replace('\r', '').split('\n'):
             line = line.strip()
-            if line.startswith('% ') and 'warning' not in line.lower():
+            if (line.startswith('% ') and 'warning' not in line.lower()
+                    and not line.startswith(cls.IOS_INFO)):
                 return line
         return None
 
@@ -1593,8 +1598,10 @@ class CiscoConsole:
         seq = (['no logging console'] if quiet else []) + list(lines) + (['logging console'] if quiet else [])
         for line in seq:
             self.h.sendline(line)
+            # генерация RSA-ключа на эмуляторе может идти десятки секунд
+            wait = 180 if line.startswith('crypto key generate') else cisexpctimeout
             try:
-                i = self.h.expect([self.CFG_PROMPT, self.ANY_EXEC], timeout=cisexpctimeout)
+                i = self.h.expect([self.CFG_PROMPT, self.ANY_EXEC], timeout=wait)
             except pexpect.TIMEOUT:
                 self._leave_config()
                 return line, 'устройство не вернуло приглашение (интерактивная команда?)'

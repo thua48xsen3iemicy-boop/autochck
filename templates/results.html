@@ -46,6 +46,9 @@
   .card:hover { transform: translateY(-1px); }
   .card.done { background: var(--ok); }
   .card.fail { background: var(--bad); }
+  .card.todo { background: var(--card); border: 1px dashed var(--muted); }
+  .card.todo .card-name { color: var(--ink); }
+  .card.todo .card-grade { color: var(--muted); background: var(--bg); }
   .card-name { font-weight: 700; font-size: 16px; color: #fff; line-height: 1.1; }
   .card-grade {
     font-size: 12px; font-weight: 600; color: #fff;
@@ -160,6 +163,7 @@
   <div class="cards">
     {% for lab in labs %}
     {% set lab_name = lab.name|default(lab.lab_path.rsplit('/', 1)[-1].rsplit('.', 1)[0], true) %}
+    {% if lab.latest %}
     <button type="button" id="card-{{ loop.index0 }}"
             class="card {{ 'done' if lab.latest.lab_done else 'fail' }}{{ ' active' if loop.index0 == sel_index else '' }}"
             data-order="{{ loop.index0 }}" data-name="{{ lab_name }}"
@@ -168,6 +172,16 @@
       <span class="card-name">{{ lab_name }}</span>
       <span class="card-grade">Оценка: {{ lab.latest.grade if lab.latest.grade is not none else '—' }}</span>
     </button>
+    {% else %}
+    {# Лаба группы с autocheck:on, которую ещё ни разу не проверяли #}
+    <button type="button" id="card-{{ loop.index0 }}"
+            class="card todo{{ ' active' if loop.index0 == sel_index else '' }}"
+            data-order="{{ loop.index0 }}" data-name="{{ lab_name }}" data-grade="100"
+            onclick="showLab({{ loop.index0 }})">
+      <span class="card-name">{{ lab_name }}</span>
+      <span class="card-grade">Не начата</span>
+    </button>
+    {% endif %}
     {% endfor %}
   </div>
   {% endif %}
@@ -175,6 +189,13 @@
   {% for lab in labs %}
   {% set latest = lab.latest %}
   <section class="lab" id="lab-{{ loop.index0 }}"{% if loop.index0 != sel_index %} style="display:none"{% endif %}>
+    {% if not latest %}
+    <div class="lab-head">
+      <h2>{{ lab.lab_path }}</h2>
+      <div class="badges"><span class="badge done">Не начата</span></div>
+    </div>
+    <p class="empty">Проверок этой лабы ещё не было. Откройте её и запустите проверку.</p>
+    {% else %}
     <div class="lab-head">
       <h2>{{ lab.lab_path }}</h2>
       <div class="badges">
@@ -203,6 +224,7 @@
       </details>
       {% endfor %}
     </details>
+    {% endif %}
     {% endif %}
   </section>
   {% endfor %}

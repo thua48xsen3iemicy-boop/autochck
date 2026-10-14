@@ -53,6 +53,10 @@ no_run = False
 force = False
 admfile_path = '/pnet/admins.txt'
 usrfile_path = '/data/username.txt'
+# Индекс группы студента (например OA-2501). Если файл есть и не пустой, на
+# дашборде показываются и ещё не проверявшиеся лабы группы с autocheck:on
+grpfile_path = '/data/group.txt'
+LABS_ROOT = '/opt/unetlab/labs'
 ipfile_path = '/data/clientip'
 if os.path.isfile(ipfile_path):
     with open(ipfile_path) as f:
@@ -219,21 +223,22 @@ def load_dashboard(db_path=RESULT_DB_PATH):
 
     Возвращает [{"lab_path", "attempts": [...], "latest": {...}}], где каждая
     попытка содержит поля runs + распарсенные errors и разбивку items.
+    Не проверявшиеся лабы группы (см. group_autocheck_labs) идут в конце
+    с attempts=[] и latest=None.
     Блокирующая функция — вызывать через run_in_executor.
     """
-    if not os.path.exists(db_path):
-        return []
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        runs = [dict(r) for r in conn.execute(
-            "SELECT * FROM runs ORDER BY lab_path, id DESC")]
-        items_by_run = {}
-        for it in conn.execute("SELECT run_id, name, score, max FROM check_items ORDER BY id"):
-            items_by_run.setdefault(it['run_id'], []).append(
-                {'name': it['name'], 'score': it['score'], 'max': it['max']})
-    finally:
-        conn.close()
+    runs, items_by_run = [], {}
+    if os.path.exists(db_path):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            runs = [dict(r) for r in conn.execute(
+                "SELECT * FROM runs ORDER BY lab_path, id DESC")]
+            for it in conn.execute("SELECT run_id, name, score, max FROM check_items ORDER BY id"):
+                items_by_run.setdefault(it['run_id'], []).append(
+                    {'name': it['name'], 'score': it['score'], 'max': it['max']})
+        finally:
+            conn.close()
 
     labs = {}
     for r in runs:
@@ -252,7 +257,7 @@ def load_dashboard(db_path=RESULT_DB_PATH):
     for lp, att in labs.items():
         # Результаты лаб без маркера autocheck:on (или удалённых) не показываем;
         # в БД они остаются и вернутся, как только маркер появится
-        if not parse_autocheck('/opt/unetlab/labs' + lp):
+        if not parse_autocheck(LABS_ROOT + lp):
             continue
         # Короткое имя лабы из пути: //GROUPS/OA-2501/KS24.unl -> KS24
         base = lp.rsplit('/', 1)[-1]
@@ -260,7 +265,58 @@ def load_dashboard(db_path=RESULT_DB_PATH):
         result.append({'lab_path': lp, 'name': name, 'attempts': att, 'latest': att[0]})
     # Лабы с самой свежей попыткой — вверх
     result.sort(key=lambda l: l['latest']['id'], reverse=True)
+    # Ещё не проверявшиеся лабы группы — после проверенных. Сопоставление по
+    # короткому имени, как в отчёте преподавателя (reportsrv.lab_key)
+    seen = {l['name'].lower() for l in result}
+    for lp in group_autocheck_labs():
+        base = lp.rsplit('/', 1)[-1]
+        name = base.rsplit('.', 1)[0]
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            result.append({'lab_path': lp, 'name': name, 'attempts': [], 'latest': None})
     return result
+
+def read_group():
+    """Индекс группы из /data/group.txt; None, если файла нет или он пуст."""
+    try:
+        with open(grpfile_path, encoding='utf-8', errors='replace') as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+def group_autocheck_labs():
+    """Пути лаб (относительно LABS_ROOT, вида /GROUPS/OA-2501/KS24.unl) с маркером
+    autocheck:on в каталоге группы студента, включая подпапку REMOTE.
+
+    Каталог группы ищется без учёта регистра. Нет group.txt / каталога — [].
+    """
+    group = read_group()
+    if not group:
+        return []
+    groups_root = os.path.join(LABS_ROOT, 'GROUPS')
+    try:
+        dirs = [e.name for e in os.scandir(groups_root) if e.is_dir()]
+    except OSError as e:
+        log('group_autocheck_labs err', e)
+        return []
+    gdir = next((d for d in dirs if d.lower() == group.lower()), None)
+    if gdir is None:
+        log('group dir not found', group)
+        return []
+    labs = []
+    for sub in ('', 'REMOTE'):
+        rel = '/GROUPS/' + gdir + ('/' + sub if sub else '')
+        try:
+            # Натуральная сортировка: KS4 раньше KS21
+            entries = sorted(os.scandir(LABS_ROOT + rel), key=lambda e: [
+                int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', e.name)])
+        except OSError:
+            continue
+        for e in entries:
+            if (e.is_file() and not e.name.startswith('.') and e.name.endswith('.unl')
+                    and parse_autocheck(e.path)):
+                labs.append(rel + '/' + e.name)
+    return labs
 
 def count_lab_attempts(lab_path, db_path=RESULT_DB_PATH):
     """Число засчитанных проверок лабы (для лимита try:N в описании).

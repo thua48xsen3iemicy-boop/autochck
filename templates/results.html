@@ -25,6 +25,7 @@
   .notice .actions a { display: inline-block; padding: 7px 14px; border-radius: 8px; text-decoration: none;
     border: 1px solid var(--line); background: var(--card); color: var(--ink); font-weight: 600; }
   .notice .actions a.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .notice .actions a.busy { opacity: .6; pointer-events: none; }
   .empty { color: var(--muted); }
   .runbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
   .runbtn { display: inline-block; padding: 9px 20px; border-radius: 10px; text-decoration: none;
@@ -145,7 +146,7 @@
 
   <div class="runbar">
     <a class="runbtn" href="ping?run=1" onclick="startRun(this)">Проверить</a>
-    <span class="runhint">Проверяется лаба, открытая сейчас. Проверка занимает до пары минут.</span>
+    <span class="runhint" id="runhint">Проверяется лаба, открытая сейчас. Перед проверкой запустите все её узлы.</span>
   </div>
 
   {% if notice %}
@@ -246,11 +247,25 @@
     history.replaceState(null, '', 'results');
   }
 
-  // Защита от повторных кликов, пока идёт проверка
+  // Защита от повторных кликов, пока идёт проверка. Сообщение об ожидании
+  // показывается только во время проверки: после ответа страница
+  // перерисовывается и кнопка снова «Проверить»
+  var RUN_HINT = document.getElementById('runhint').textContent;
   function startRun(a) {
-    a.classList.add('busy');
+    var btns = document.querySelectorAll('.runbtn, .notice .actions a.primary');
+    for (var i = 0; i < btns.length; i++) { btns[i].classList.add('busy'); }
     a.textContent = 'Проверка идёт…';
+    document.getElementById('runhint').textContent = 'Идёт проверка, это может занять пару минут. Не закрывайте страницу.';
   }
+  // Возврат на страницу кнопкой «Назад» (из кеша браузера) — сбросить кнопку
+  window.addEventListener('pageshow', function(e) {
+    if (!e.persisted) return;
+    var b = document.querySelector('.runbtn');
+    if (b) { b.classList.remove('busy'); b.textContent = 'Проверить'; }
+    var c = document.querySelector('.notice .actions a.primary');
+    if (c) { c.classList.remove('busy'); c.textContent = 'Запустить проверку'; }
+    document.getElementById('runhint').textContent = RUN_HINT;
+  });
 
   function showLab(i) {
     var labs = document.querySelectorAll('.lab');

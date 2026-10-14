@@ -787,10 +787,31 @@ def find_uuid_in_file_and_ps(file_path):
             #print(dict_of_name_and_ostype)
 
         else:
-            return("multilab", output)
+            return("multilab", nodes_run_diag(dict_of_vmname_and_uid, output))
     else:
         log('Лишние ноды', output)
-        return("count", output)
+        return("count", nodes_run_diag(dict_of_vmname_and_uid, output))
+
+def nodes_run_diag(dict_of_vmname_and_uid, ps_lines):
+    """Какие узлы лабы не запущены и сколько чужих qemu-процессов запущено:
+    {'missing': [имена], 'extra': int, 'ps': ps_lines}."""
+    joined = ' '.join(ps_lines)
+    uids = set(dict_of_vmname_and_uid.values())
+    missing = sorted(n for n, u in dict_of_vmname_and_uid.items() if u not in joined)
+    extra = sum(1 for l in ps_lines if not any(u in l for u in uids))
+    return {'missing': missing, 'extra': extra, 'ps': ps_lines}
+
+def nodes_run_message(diag):
+    """Текст для студента, почему лаба не проверяется (узлы не запущены/чужие)."""
+    parts = []
+    if diag.get('missing'):
+        parts.append('Не запущены узлы: ' + ', '.join(diag['missing']) + '.')
+    if diag.get('extra'):
+        parts.append(f'Запущены узлы другой лабы ({diag["extra"]}) — остановите их.')
+    if not parts:
+        parts.append('Не все узлы лабы запущены.')
+    return ('Проверка не выполнена. ' + ' '.join(parts) +
+            ' Запустите все узлы лабы, дождитесь их загрузки и нажмите «Проверить» снова.')
 
 def parse_unl_nodes(lab_file):
     """Разбирает ноды из файла лабы (.unl):
@@ -2934,7 +2955,12 @@ async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(
                         os.remove('/tmp/chk.lock')
                         forweb['username'] = username
                         forweb['lab_path'] = "Ошибка чтения сокета"
-                        return forweb
+                        if username in admin_list or fmt == 'json':
+                            return forweb
+                        return await render_dashboard(
+                            request, status='err', current_lab=answer.get('lab_path'),
+                            notice=f'Проверка не выполнена: узел {fullcmdout[0]} не отвечает. '
+                                   'Возможно, он ещё загружается — подождите и нажмите «Проверить» снова.')
                     script_OUT = {}
                     current_section = None
                     if fullcmdout[3] == 'windows':
@@ -4087,17 +4113,19 @@ async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(
 
 
             else:
-                log('err', 'Не все ноды запущены или запущены лишние в другой лабе')
-                answer['errorinfo'] = f'Не все ноды запущены или запущены лишние в другой лабе. {dict_of_vmname_and_uid}'
+                log('err', f'Не все ноды запущены или запущены лишние в другой лабе: {dict_of_vmname_and_uid}')
+                answer['errorinfo'] = nodes_run_message(dict_of_vmname_and_uid)
                 forweb['lab_path'] = lab_path.replace('/opt/unetlab/labs', '')
                 answer['status'] = 'warn'
         else:
             if lab == 'moreone':
-                answer['errorinfo'] = f'Ошибка, перезайдите в лабу'
+                answer['errorinfo'] = ('Проверка не выполнена: открыто несколько лаб. '
+                                       'Закройте лишние, перезайдите в нужную лабу и нажмите «Проверить» снова.')
                 forweb['lab_path'] = 'Ошибка, перезайдите в лабу'
                 answer['status'] = 'warn'
             else:
-                answer['errorinfo'] = 'Нет открытой лабы'
+                answer['errorinfo'] = ('Проверка не выполнена: нет открытой лабы. '
+                                       'Откройте лабу, запустите все узлы и нажмите «Проверить».')
                 forweb['lab_path'] = 'Нет открытой лабы'
                 answer['status'] = 'warn'
 
@@ -4201,7 +4229,10 @@ async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(
 
 
     except Exception:
-        os.remove('/tmp/chk.lock')
+        try:
+            os.remove('/tmp/chk.lock')
+        except OSError:
+            pass
         error_traceback = traceback.format_exc()
         log('Внутренняя ошибка скрипта:', error_traceback)
         answer['errorinfo'] = 'internal_err ' + error_traceback
@@ -4210,7 +4241,13 @@ async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(
         answer['status'] = 'err'
         forwebresult = {}
         forwebresult.update(answer)
-        return forwebresult 
+        if username in admin_list or fmt == 'json':
+            return forwebresult
+        return await render_dashboard(
+            request, status='err',
+            notice='Проверка не выполнена из-за внутренней ошибки. Убедитесь, что все узлы '
+                   'запущены и загрузились, и нажмите «Проверить» снова. Если ошибка '
+                   'повторяется — сообщите преподавателю.')
         #return "Внутренняя ошибка скрипта", error_traceback
 
 if not no_run:

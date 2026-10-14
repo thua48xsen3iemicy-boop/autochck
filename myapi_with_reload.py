@@ -158,6 +158,13 @@ try:
 except ImportError:
     CHECK_LABELS = {}
 
+# Подготовка лаб (prepare:on) и варианты студентов — labprep.py рядом со
+# скриптом. Без него подготовка недоступна, остальное работает как раньше
+try:
+    import labprep
+except ImportError:
+    labprep = None
+
 # Диагностические словари, собранные при проверке, — их сохраняем в debug_json,
 # чтобы сервер отчётов мог показать «собранную информацию» по попытке. Снимок
 # делается ДО pop() (см. финальный return), иначе часть словарей уже удалена.
@@ -218,7 +225,7 @@ def save_run(run, checks, db_path=RESULT_DB_PATH):
     finally:
         conn.close()
 
-def load_dashboard(db_path=RESULT_DB_PATH):
+def load_dashboard(db_path=RESULT_DB_PATH, extra_labs=()):
     """Читает историю прогонов для дашборда: список лаб, внутри — попытки (новые первыми).
 
     Возвращает [{"lab_path", "attempts": [...], "latest": {...}}], где каждая
@@ -232,11 +239,14 @@ def load_dashboard(db_path=RESULT_DB_PATH):
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         try:
-            runs = [dict(r) for r in conn.execute(
-                "SELECT * FROM runs ORDER BY lab_path, id DESC")]
-            for it in conn.execute("SELECT run_id, name, score, max FROM check_items ORDER BY id"):
-                items_by_run.setdefault(it['run_id'], []).append(
-                    {'name': it['name'], 'score': it['score'], 'max': it['max']})
+            # БД могла появиться раньше первой проверки: подготовка лабы
+            # пишет только таблицу preps
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='check_items'").fetchone():
+                runs = [dict(r) for r in conn.execute(
+                    "SELECT * FROM runs ORDER BY lab_path, id DESC")]
+                for it in conn.execute("SELECT run_id, name, score, max FROM check_items ORDER BY id"):
+                    items_by_run.setdefault(it['run_id'], []).append(
+                        {'name': it['name'], 'score': it['score'], 'max': it['max']})
         finally:
             conn.close()
 
@@ -265,16 +275,43 @@ def load_dashboard(db_path=RESULT_DB_PATH):
         result.append({'lab_path': lp, 'name': name, 'attempts': att, 'latest': att[0]})
     # Лабы с самой свежей попыткой — вверх
     result.sort(key=lambda l: l['latest']['id'], reverse=True)
-    # Ещё не проверявшиеся лабы группы — после проверенных. Сопоставление по
-    # короткому имени, как в отчёте преподавателя (reportsrv.lab_key)
+    # Ещё не проверявшиеся лабы — после проверенных: открытая лаба с
+    # подготовкой (extra_labs), уже подготовленные и лабы группы.
+    # Сопоставление по короткому имени, как в отчёте преподавателя (reportsrv.lab_key)
     seen = {l['name'].lower() for l in result}
-    for lp in group_autocheck_labs():
+    pending = list(extra_labs) + prepared_labs(db_path)
+    pending = [lp for lp in pending if parse_autocheck(LABS_ROOT + lp)] + group_autocheck_labs()
+    for lp in pending:
         base = lp.rsplit('/', 1)[-1]
         name = base.rsplit('.', 1)[0]
         if name.lower() not in seen:
             seen.add(name.lower())
             result.append({'lab_path': lp, 'name': name, 'attempts': [], 'latest': None})
+    # Лабы с подготовкой (prepare:on): вариант студента, задание, когда готовилась
+    for lab in result:
+        try:
+            lab['prep'] = lab_prep_info(lab['lab_path'])
+        except Exception as e:
+            log('lab_prep_info err', e)
+            lab['prep'] = None
     return result
+
+def prepared_labs(db_path=RESULT_DB_PATH):
+    """Пути лаб, которые студент хоть раз подготавливал (таблица preps)."""
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='preps'").fetchone():
+                return []
+            return [r[0] for r in conn.execute(
+                "SELECT lab_path FROM preps GROUP BY lab_path ORDER BY MAX(id) DESC")]
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        log('prepared_labs err', e)
+        return []
 
 def read_group():
     """Индекс группы из /data/group.txt; None, если файла нет или он пуст."""
@@ -801,8 +838,9 @@ def nodes_run_diag(dict_of_vmname_and_uid, ps_lines):
     extra = sum(1 for l in ps_lines if not any(u in l for u in uids))
     return {'missing': missing, 'extra': extra, 'ps': ps_lines}
 
-def nodes_run_message(diag):
-    """Текст для студента, почему лаба не проверяется (узлы не запущены/чужие)."""
+def nodes_run_message(diag, what='Проверка', button='Проверить'):
+    """Текст для студента, почему лаба не проверяется/не готовится (узлы не
+    запущены/чужие)."""
     parts = []
     if diag.get('missing'):
         parts.append('Не запущены узлы: ' + ', '.join(diag['missing']) + '.')
@@ -810,8 +848,8 @@ def nodes_run_message(diag):
         parts.append(f'Запущены узлы другой лабы ({diag["extra"]}) — остановите их.')
     if not parts:
         parts.append('Не все узлы лабы запущены.')
-    return ('Проверка не выполнена. ' + ' '.join(parts) +
-            ' Запустите все узлы лабы, дождитесь их загрузки и нажмите «Проверить» снова.')
+    return (f'{what} не выполнена. ' + ' '.join(parts) +
+            f' Запустите все узлы лабы, дождитесь их загрузки и нажмите «{button}» снова.')
 
 def parse_unl_nodes(lab_file):
     """Разбирает ноды из файла лабы (.unl):
@@ -1283,6 +1321,8 @@ class LabCheckContext:
     ctx.nodes, ctx.ostype       — имена узлов лабы и их тип ОС
     ctx.lab_path                — полный путь к .unl
     ctx.answer                  — словарь ответа /ping (отладка, JSON админу)
+    ctx.v                       — вариант студента (VARIANT в файле лабы,
+                                  см. labprep.py); None, если варианта нет
     """
     def __init__(self, lab_path, dict_of_name_and_ostype, dict_of_name_and_path,
                  add_check, errors_list, answer):
@@ -1294,6 +1334,7 @@ class LabCheckContext:
         self._add_check = add_check
         self._errors = errors_list
         self.added = set()  # имена пунктов, добавленных файлом проверок
+        self.v = None
 
     async def run(self, node, cmd):
         qga = QGA_OSTYPES.get(self.ostype.get(node))
@@ -1319,6 +1360,18 @@ def lab_checks_file(lab_path):
     stem = os.path.basename(lab_path).rsplit('.', 1)[0]
     return stem, os.path.join(LAB_CHECKS_DIR, stem + '.py')
 
+def load_lab_module(path, stem):
+    """Исполняет файл лабы заново (без importlib/sys.modules и кеша
+    байткода). С labprep в пространство имён файла подставляются net(),
+    host_in() и прочее для VARIANT."""
+    if labprep is not None:
+        return labprep.load_module(path)
+    module = types.ModuleType(f'lab_checks_{stem}')
+    module.__file__ = path
+    with open(path, encoding='utf-8') as f:
+        exec(compile(f.read(), path, 'exec'), module.__dict__)
+    return module
+
 async def run_lab_checks(ctx):
     """Выполняет доп. проверки лабы, если для неё есть файл в LAB_CHECKS_DIR.
 
@@ -1336,12 +1389,9 @@ async def run_lab_checks(ctx):
     log('lab checks', path)
     keep = None
     try:
-        # Без importlib/sys.modules: исходник читается и исполняется заново
-        # каждый раз, никакого кеша байткода
-        module = types.ModuleType(f'lab_checks_{stem}')
-        module.__file__ = path
-        with open(path, encoding='utf-8') as f:
-            exec(compile(f.read(), path, 'exec'), module.__dict__)
+        module = load_lab_module(path, stem)
+        if labprep is not None and labprep.has_variant(module):
+            ctx.v = labprep.make_variant(module, username, stem)
         if getattr(module, 'ONLY_EXTRA', False):
             keep = list(getattr(module, 'KEEP', ['Hostnames']))
         check = getattr(module, 'check', None)
@@ -1355,6 +1405,299 @@ async def run_lab_checks(ctx):
         return keep, (f'Доп. проверка лабы не выполнена из-за ошибки ({stem}.py): '
                       f'{type(e).__name__}: {e}. Результат не засчитан, сообщите преподавателю')
     return keep, None
+
+############################################################ LAB PREPARE
+# Лаба с маркером prepare:on в description сначала готовится: кнопка
+# «Подготовить лабу» (/ping?prepare=1) выполняет prepare(ctx) из файла лабы
+# в /pnet/checks на запущенных узлах (только Linux) и ставит на каждый
+# настроенный узел метку с отпечатком варианта. Проверка такой лабы идёт,
+# только если подготовка была и метки на месте (узел не вайпнули). Вариант
+# студента и готовые действия — labprep.py, пример — checks/_prepare_template.py.
+
+CHK_LOCK = '/tmp/chk.lock'
+
+def parse_desc_flag(lab_file, key):
+    """Маркер key:on (yes/1/true) в <description> лабы."""
+    desc = read_lab_description(lab_file)
+    if desc is None:
+        return False
+    pm = re.search(r'\b' + re.escape(key) + r'\s*:\s*(\S+)', desc, re.IGNORECASE)
+    return bool(pm and pm.group(1).lower() in ('on', 'yes', '1', 'true'))
+
+def norm_lab_path(lab_path):
+    """'//GROUPS/G/L.unl' -> '/GROUPS/G/L.unl' (в lab_sessions бывает и так, и так)."""
+    return re.sub(r'/+', '/', str(lab_path))
+
+def open_lab_path():
+    """Путь открытой лабы без побочных эффектов (в отличие от
+    fetch_single_lab_session, которая при нескольких лабах сбрасывает сессии).
+    None — лабы нет, их несколько или БД недоступна."""
+    try:
+        conn = pymysql.connect(host='localhost', user='pnetlab', password='pnetlab', database='pnetlab_db')
+    except Exception as e:
+        log('open_lab_path err', e)
+        return None
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT lab_session_path FROM lab_sessions WHERE lab_session_pod IN (43, 44) "
+                           "AND lab_session_joined = lab_session_pod")
+            rows = cursor.fetchall()
+        return str(rows[0][0]) if len(rows) == 1 else None
+    except Exception as e:
+        log('open_lab_path err', e)
+        return None
+    finally:
+        conn.close()
+
+def qga_paths():
+    """{имя узла: путь к его каталогу в /opt/unetlab/tmp} для всех запущенных
+    qemu-узлов (как в get_name_and_path_by_int_id, но одним ps и без
+    привязки к сетевым интерфейсам)."""
+    try:
+        output = subprocess.check_output(['ps', 'axww', '-o', 'args'], universal_newlines=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        log('qga_paths err', e)
+        return {}
+    paths = {}
+    for line in output.splitlines():
+        if 'qemu' not in line:
+            continue
+        nm = re.search(r'-name (\S+)', line)
+        pm = re.search(r'id=monitor,path=/opt/unetlab/tmp/(\S+?)monitor\.sock', line)
+        if nm and pm:
+            paths[nm.group(1)] = pm.group(1)
+    return paths
+
+def qga_exec_full_sync(command, socket_path, max_wait=300):
+    """sh -c command на Linux-узле через qemu-guest-agent.
+
+    Возвращает (код возврата, stdout, stderr). Код None — команда не
+    выполнилась (узел не отвечает, агент не запустил её, вышло время);
+    причина — в третьем элементе.
+    """
+    path = f'/data/tmp/{socket_path}qga.sock'
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(15)
+    try:
+        sock.connect(path)
+        sock.sendall(json.dumps({'execute': 'guest-exec', 'arguments': {
+            'path': '/bin/sh', 'arg': ['-c', command], 'capture-output': True}}).encode('utf-8'))
+        resp = qga_recv_json(sock)
+        pid = resp.get('return', {}).get('pid')
+        if not pid:
+            return None, '', f'qemu-guest-agent не запустил команду: {resp.get("error")}'
+        start = time.time()
+        while True:
+            sock.sendall(json.dumps({'execute': 'guest-exec-status',
+                                     'arguments': {'pid': pid}}).encode('utf-8'))
+            r = qga_recv_json(sock).get('return', {})
+            if r.get('exited'):
+                dec = lambda k: base64.b64decode(r.get(k) or '').decode('utf-8', 'replace')
+                rc = r.get('exitcode')
+                if rc is None:
+                    rc = 128 + int(r.get('signal') or 0) if r.get('signal') else 1
+                return rc, dec('out-data'), dec('err-data')
+            if time.time() - start > max_wait:
+                return None, '', f'команда не завершилась за {max_wait} с'
+            time.sleep(0.3)
+    except (OSError, ValueError) as e:
+        log('qga_exec_full err', f'{path}: {e!r}')
+        return None, '', 'узел не отвечает (возможно, ещё загружается)'
+    finally:
+        sock.close()
+
+async def qga_exec_full(command, socket_path):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, qga_exec_full_sync, command, socket_path)
+
+def _preps_conn(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.execute("""CREATE TABLE IF NOT EXISTS preps (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts TEXT, lab_path TEXT, token TEXT,
+                        nodes_json TEXT, variant_json TEXT)""")
+    return conn
+
+def save_prep(lab_path, token, nodes, items, db_path=RESULT_DB_PATH):
+    conn = _preps_conn(db_path)
+    try:
+        conn.execute("INSERT INTO preps (ts, lab_path, token, nodes_json, variant_json) VALUES (?, ?, ?, ?, ?)",
+                     (datetime.now().strftime('%d.%m.%Y %H:%M'), norm_lab_path(lab_path), token,
+                      json.dumps(list(nodes), ensure_ascii=False), json.dumps(items, ensure_ascii=False)))
+        conn.commit()
+    finally:
+        conn.close()
+
+def load_prep(lab_path, db_path=RESULT_DB_PATH):
+    """Последняя подготовка лабы: {'ts', 'token', 'nodes'} или None."""
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = _preps_conn(db_path)
+        try:
+            row = conn.execute("SELECT ts, token, nodes_json FROM preps WHERE lab_path = ? "
+                               "ORDER BY id DESC LIMIT 1", (norm_lab_path(lab_path),)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        log('load_prep err', e)
+        return None
+    if not row:
+        return None
+    return {'ts': row[0], 'token': row[1], 'nodes': json.loads(row[2] or '[]')}
+
+def lab_variant(module, stem):
+    """(вариант, отпечаток) студента для лабы; без VARIANT — пустой вариант."""
+    v = labprep.make_variant(module, username, stem) if labprep.has_variant(module) else labprep.Variant()
+    return v, labprep.variant_token(v, stem)
+
+def lab_prep_info(lab_rel):
+    """Для дашборда: вариант, задание и состояние подготовки лабы с
+    prepare:on. None — лаба без подготовки. Блокирующая."""
+    if labprep is None or not parse_desc_flag(LABS_ROOT + lab_rel, 'prepare'):
+        return None
+    stem, path = lab_checks_file(lab_rel)
+    info = {'variant': [], 'task': None, 'prep': None, 'error': None, 'stale': False}
+    try:
+        module = load_lab_module(path, stem)
+        v, token = lab_variant(module, stem)
+        info['variant'] = labprep.variant_items(v)
+        info['task'] = labprep.task_text(module, v)
+    except Exception as e:
+        log('lab_prep_info err', traceback.format_exc())
+        info['error'] = f'Вариант не построен: {type(e).__name__}: {e}. Сообщите преподавателю'
+        return info
+    rec = load_prep(lab_rel)
+    if rec:
+        info['prep'] = rec['ts']
+        info['stale'] = rec['token'] != token
+    return info
+
+async def prep_gate(lab_rel):
+    """Можно ли проверять лабу с prepare:on: None — да, иначе сообщение.
+
+    Если узлы не запущены, возвращает None: об этом скажет основная проверка.
+    """
+    if labprep is None:
+        return 'Проверка не выполнена: подготовка лаб недоступна (нет labprep.py). Сообщите преподавателю.'
+    lab_file = LABS_ROOT + lab_rel
+    stem, path = lab_checks_file(lab_rel)
+    try:
+        module = load_lab_module(path, stem)
+        _v, token = lab_variant(module, stem)
+    except Exception as e:
+        log('prep_gate err', traceback.format_exc())
+        return (f'Проверка не выполнена: ошибка в файле лабы ({stem}.py): {type(e).__name__}: {e}. '
+                'Сообщите преподавателю.')
+    loop = asyncio.get_event_loop()
+    rec = await loop.run_in_executor(None, load_prep, lab_rel)
+    if not rec:
+        return ('Проверка не выполнена: лаба ещё не подготовлена. Запустите все узлы, '
+                'нажмите «Подготовить лабу», выполните задание и затем нажмите «Проверить».')
+    if rec['token'] != token:
+        return ('Проверка не выполнена: вариант лабы изменился после подготовки. '
+                'Нажмите «Подготовить лабу» ещё раз.')
+    ostype, _diag = find_uuid_in_file_and_ps(lab_file)
+    if not isinstance(ostype, dict) or not rec['nodes']:
+        return None
+    paths = qga_paths()
+    bad = []
+    for node in rec['nodes']:
+        if node not in paths:
+            bad.append(node)
+            continue
+        rc, out, err = await qga_exec_full(labprep.MARKER_READ_CMD, paths[node])
+        if rc is None:
+            return (f'Проверка не выполнена: узел {node} не отвечает. Возможно, он ещё '
+                    'загружается — подождите и нажмите «Проверить» снова.')
+        if out.strip() != token:
+            bad.append(node)
+    if bad:
+        log('prep markers missing', bad)
+        return (f'Проверка не выполнена: узлы {", ".join(bad)} сброшены после подготовки (wipe). '
+                'Нажмите «Подготовить лабу» ещё раз — подготовка повторится на всех узлах, '
+                'затем восстановите свою работу на сброшенных узлах и нажмите «Проверить».')
+    return None
+
+async def run_prepare(request, fmt):
+    """/ping?prepare=1: подготовка открытой лабы. Студенту — дашборд с
+    результатом, админу и по fmt=json — JSON."""
+    async def reply(notice, status, lab_rel=None):
+        if username in admin_list or fmt == 'json':
+            res = {'username': username, 'status': status, 'errorinfo': notice}
+            if lab_rel:
+                res['lab_path'] = lab_rel
+            return res
+        return await render_dashboard(request, notice=notice, status=status, current_lab=lab_rel)
+
+    if labprep is None:
+        return await reply('Подготовка недоступна: нет labprep.py рядом со скриптом. Сообщите преподавателю.', 'err')
+    if os.path.isfile(CHK_LOCK):
+        return await reply('Проверка или подготовка уже выполняется, подождите…', 'err')
+    open(CHK_LOCK, 'a').close()
+    lab_rel = None
+    try:
+        lab = fetch_single_lab_session()
+        if lab == 'no':
+            return await reply('Подготовка не выполнена: нет открытой лабы. Откройте лабу, '
+                               'запустите все узлы и нажмите «Подготовить лабу».', 'warn')
+        if lab == 'moreone':
+            return await reply('Подготовка не выполнена: открыто несколько лаб. Закройте лишние, '
+                               'перезайдите в нужную лабу и нажмите «Подготовить лабу» снова.', 'warn')
+        lab_rel = str(lab[1])
+        lab_file = LABS_ROOT + lab_rel
+        if not parse_desc_flag(lab_file, 'prepare'):
+            return await reply('Открытая лаба не требует подготовки.', 'warn', lab_rel)
+        stem, path = lab_checks_file(lab_rel)
+        if not os.path.isfile(path):
+            return await reply(f'Подготовка не выполнена: для лабы нет файла {stem}.py. '
+                               'Сообщите преподавателю.', 'err', lab_rel)
+        module = load_lab_module(path, stem)
+        prepare = getattr(module, 'prepare', None)
+        if not callable(prepare):
+            return await reply(f'Подготовка не выполнена: в {stem}.py нет функции prepare(ctx). '
+                               'Сообщите преподавателю.', 'err', lab_rel)
+        ostype, diag = find_uuid_in_file_and_ps(lab_file)
+        if not isinstance(ostype, dict):
+            return await reply(nodes_run_message(diag, 'Подготовка', 'Подготовить лабу'), 'warn', lab_rel)
+        v, token = lab_variant(module, stem)
+        paths = qga_paths()
+
+        async def exec_fn(node, cmd):
+            if node not in paths:
+                return None, '', 'не найден процесс узла'
+            return await qga_exec_full(cmd, paths[node])
+
+        ctx = labprep.PrepareContext(v, ostype, exec_fn, username, stem)
+        log('lab prepare', f'{lab_rel} token={token}')
+        try:
+            result = prepare(ctx)
+            if inspect.isawaitable(result):
+                await result
+            for node in ctx.touched:
+                await ctx.write_marker(node, token)
+        except labprep.PrepareError as e:
+            log('lab prepare failed', str(e))
+            hint = ('Это ошибка в файле подготовки лабы — сообщите преподавателю.' if e.teacher else
+                    'Если узел ещё загружается — подождите и нажмите «Подготовить лабу» снова; '
+                    'если ошибка повторяется — сообщите преподавателю.')
+            return await reply(f'Подготовка не выполнена: узел {e.node}, шаг «{e.step}»: {e.detail}. {hint}',
+                               'err', lab_rel)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, save_prep, lab_rel, token, ctx.touched,
+                                   labprep.variant_items(v))
+        nodes = ', '.join(ctx.touched) or 'настраивать было нечего'
+        return await reply(f'Лаба подготовлена (узлы: {nodes}). Ваш вариант — в блоке лабы ниже. '
+                           'Выполните задание и нажмите «Проверить».', 'ok', lab_rel)
+    except Exception as e:
+        log('lab prepare err', traceback.format_exc())
+        return await reply(f'Подготовка не выполнена из-за ошибки: {type(e).__name__}: {e}. '
+                           'Сообщите преподавателю.', 'err', lab_rel)
+    finally:
+        try:
+            os.remove(CHK_LOCK)
+        except OSError:
+            pass
 
 def remove_ansi_sequences(text):
     ansi_escape = re.compile(r'''
@@ -2718,11 +3061,24 @@ async def render_dashboard(request: Request, notice=None, status=None, current_l
     (лаба с лимитом попыток try:N).
     """
     loop = asyncio.get_event_loop()
-    labs = await loop.run_in_executor(None, load_dashboard)
+    # Кнопка «Подготовить лабу» — только пока открыта лаба с prepare:on; эта
+    # лаба (с вариантом студента) показывается и выбирается, даже если её
+    # ещё не проверяли
+    prep_lab = open_rel = None
+    if labprep is not None:
+        open_rel = await loop.run_in_executor(None, open_lab_path)
+        if open_rel and parse_desc_flag(LABS_ROOT + open_rel, 'prepare'):
+            prep_lab = os.path.basename(open_rel).rsplit('.', 1)[0]
+            current_lab = current_lab or open_rel
+        else:
+            open_rel = None
+    labs = await loop.run_in_executor(None, load_dashboard, RESULT_DB_PATH,
+                                      [open_rel] if open_rel else [])
     sel_index = 0
     if current_lab:
+        want = os.path.basename(current_lab).rsplit('.', 1)[0].lower()
         for i, lab in enumerate(labs):
-            if lab['lab_path'] == current_lab:
+            if lab['lab_path'] == current_lab or lab['name'].lower() == want:
                 sel_index = i
                 break
     return templates.TemplateResponse("results.html", {
@@ -2735,6 +3091,7 @@ async def render_dashboard(request: Request, notice=None, status=None, current_l
         "notice": notice,
         "status": status,
         "confirm": confirm,
+        "prep_lab": prep_lab,
     })
 
 @app.get("/results", response_class=HTMLResponse)
@@ -2758,10 +3115,12 @@ LINUX_SECTIONS = ('SSHD', 'DNSSERVER', 'IPADDR', 'IPROUTE', 'HOSTNAME', 'FORWARD
 WIN_SECTIONS = ('IPADDR', 'IPROUTE', 'HOSTNAME', 'DNSCLI')
 @app.get("/ping")
 async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(0),
-               run: int = Query(0)):
+               run: int = Query(0), prepare: int = Query(0)):
     # Проверка запускается только явно: кнопкой «Проверить» (?run=1) или
     # подтверждением лабы с лимитом попыток (?confirm=1). Простой заход на
-    # /ping только показывает дашборд
+    # /ping только показывает дашборд. ?prepare=1 — «Подготовить лабу»
+    if prepare:
+        return await run_prepare(request, fmt)
     if not (run or confirm):
         if fmt == 'json':
             return {'username': username, 'status': 'idle',
@@ -2891,6 +3250,12 @@ async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(
             try_limit = parse_try_limit('/opt/unetlab/labs' + str(lab[1]))
             if try_limit:
                 try_used = count_lab_attempts(str(lab[1]))
+        # Лаба с prepare:on проверяется, только если подготовлена и метки
+        # подготовки на узлах на месте (попытка try:N при отказе не тратится)
+        prep_msg = None
+        if (lab_opened and parse_autocheck(LABS_ROOT + str(lab[1]))
+                and parse_desc_flag(LABS_ROOT + str(lab[1]), 'prepare')):
+            prep_msg = await prep_gate(str(lab[1]))
         if lab_opened and not parse_autocheck('/opt/unetlab/labs' + str(lab[1])):
             # Лаба без маркера autocheck:on в описании не проверяется и в БД
             # не попадает (save_run только при status 200)
@@ -2905,6 +3270,12 @@ async def ping(request: Request, fmt: str = Query('auto'), confirm: int = Query(
             forweb['lab_path'] = str(lab[1])
             answer['errorinfo'] = (f'Попытки проверки этой лабы исчерпаны ({try_used} из {try_limit}). '
                                    'Результат — в истории ниже')
+            answer['status'] = 'warn'
+        elif prep_msg:
+            log('lab not prepared', prep_msg)
+            answer['lab_path'] = str(lab[1])
+            forweb['lab_path'] = str(lab[1])
+            answer['errorinfo'] = prep_msg
             answer['status'] = 'warn'
         elif try_limit and not confirm:
             answer['lab_path'] = str(lab[1])

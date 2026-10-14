@@ -26,6 +26,11 @@
     border: 1px solid var(--line); background: var(--card); color: var(--ink); font-weight: 600; }
   .notice .actions a.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .empty { color: var(--muted); }
+  .runbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  .runbtn { display: inline-block; padding: 9px 20px; border-radius: 10px; text-decoration: none;
+    background: var(--accent); color: #fff; font-weight: 600; }
+  .runbtn.busy { opacity: .6; pointer-events: none; }
+  .runhint { color: var(--muted); font-size: 13px; }
 
   .sortbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
   .sortlabel { color: var(--muted); font-size: 13px; margin-right: 2px; }
@@ -138,11 +143,16 @@
     <div class="meta">Студент: <b>{{ username }}</b>{% if clientip and clientip != 'False' %} · IP: {{ clientip }}{% endif %}</div>
   </header>
 
+  <div class="runbar">
+    <a class="runbtn" href="ping?run=1" onclick="startRun(this)">Проверить</a>
+    <span class="runhint">Проверяется лаба, открытая сейчас. Проверка занимает до пары минут.</span>
+  </div>
+
   {% if notice %}
   <div class="notice{% if status == 'err' %} err{% endif %}">{{ notice }}
     {% if confirm %}
     <div class="actions">
-      <a class="primary" href="ping?confirm=1">Запустить проверку</a>
+      <a class="primary" href="ping?confirm=1" onclick="startRun(this)">Запустить проверку</a>
       <a href="results">Отмена</a>
     </div>
     {% endif %}
@@ -150,7 +160,7 @@
   {% endif %}
 
   {% if not labs %}
-  <p class="empty">Пока нет ни одной проверки. Запустите проверку открытой лабораторной работы.</p>
+  <p class="empty">Пока нет ни одной проверки. Откройте лабораторную работу и нажмите «Проверить».</p>
   {% endif %}
 
   {% if labs %}
@@ -194,7 +204,7 @@
       <h2>{{ lab.lab_path }}</h2>
       <div class="badges"><span class="badge done">Не начата</span></div>
     </div>
-    <p class="empty">Проверок этой лабы ещё не было. Откройте её и запустите проверку.</p>
+    <p class="empty">Проверок этой лабы ещё не было. Откройте её и нажмите «Проверить».</p>
     {% else %}
     <div class="lab-head">
       <h2>{{ lab.lab_path }}</h2>
@@ -230,6 +240,18 @@
   {% endfor %}
 </div>
 <script>
+  // После проверки адрес ping?run=1 меняем на results, чтобы обновление
+  // страницы (F5) не запускало проверку повторно
+  if (/[?&](run|confirm)=/.test(location.search) && window.history.replaceState) {
+    history.replaceState(null, '', 'results');
+  }
+
+  // Защита от повторных кликов, пока идёт проверка
+  function startRun(a) {
+    a.classList.add('busy');
+    a.textContent = 'Проверка идёт…';
+  }
+
   function showLab(i) {
     var labs = document.querySelectorAll('.lab');
     for (var k = 0; k < labs.length; k++) { labs[k].style.display = (k === i) ? '' : 'none'; }

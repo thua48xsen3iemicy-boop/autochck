@@ -174,9 +174,9 @@
     <a class="runbtn" href="ping?run=1" data-label="Проверить" onclick="startRun(this, 'Проверка идёт…')">Проверить</a>
     {% if prep_lab %}
     <a class="runbtn prep" href="ping?prepare=1" data-label="Подготовить лабу"
-       onclick="startRun(this, 'Подготовка идёт…')">Подготовить лабу</a>
+       onclick="startRun(this, 'Подготовка идёт…', 'Не открывайте консоли узлов, пока идёт подготовка.')">Подготовить лабу</a>
     {% endif %}
-    <span class="runhint" id="runhint">{% if prep_lab %}Открытая лаба {{ prep_lab }} требует подготовки: запустите все её узлы, дождитесь загрузки и нажмите «Подготовить лабу», затем выполните задание и нажмите «Проверить».{% else %}Кнопка проверит лабу, открытую в PNETLab. Сначала запустите все её узлы и дождитесь их загрузки.{% endif %}</span>
+    <span class="runhint" id="runhint">{% if prep_lab %}Открытая лаба {{ prep_lab }} требует подготовки: запустите все её узлы, дождитесь загрузки и нажмите «Подготовить лабу» (не открывайте консоли узлов, пока она идёт), затем выполните задание и нажмите «Проверить».{% else %}Кнопка проверит лабу, открытую в PNETLab. Сначала запустите все её узлы и дождитесь их загрузки.{% endif %}</span>
   </div>
 
   {% if notice %}
@@ -285,12 +285,12 @@
   // перерисовывается и кнопка снова «Проверить»
   var RUN_HINT = document.getElementById('runhint').textContent;
   var RUN_BTNS = '.runbtn, .notice .actions a.primary';
-  function startRun(a, busyText) {
+  function startRun(a, busyText, extraHint) {
     var btns = document.querySelectorAll(RUN_BTNS);
     for (var i = 0; i < btns.length; i++) { btns[i].classList.add('busy'); }
     a.textContent = busyText;
     document.getElementById('runhint').textContent = busyText.replace('…', '') +
-      ', это может занять пару минут. Не закрывайте страницу.';
+      ', это может занять пару минут. Не закрывайте страницу.' + (extraHint ? ' ' + extraHint : '');
   }
   // Возврат на страницу кнопкой «Назад» (из кеша браузера) — сбросить кнопки
   window.addEventListener('pageshow', function(e) {

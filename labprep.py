@@ -3,7 +3,8 @@
 Лаба с маркером prepare:on в <description> сначала готовится: студент
 запускает все узлы и нажимает «Подготовить лабу», а функция prepare(ctx) из
 файла лабы (/pnet/checks/<лаба>.py, тот же файл, что и для check(ctx))
-раскатывает на узлы начальную настройку. Пока подготовлены только Linux-узлы.
+раскатывает на узлы начальную настройку. Подготавливаются Linux-узлы
+(через qemu-guest-agent) и Cisco IOL/vIOS (конфиг через консоль).
 
 Вариант студента описывается в файле лабы:
 
@@ -304,19 +305,25 @@ def task_text(module, v):
 # ================================================================== подготовка
 
 # Тип узла из файла лабы (template) -> семейство ОС для готовых действий
-OS_FAMILY = {'linux': 'linux', 'proxmox': 'linux'}
+OS_FAMILY = {'linux': 'linux', 'proxmox': 'linux',
+             'iol': 'cisco', 'vios': 'cisco', 'viosl2': 'cisco'}
 
 MARKER_PATH = '/etc/autochck-prep'
 _IFACE_RE = re.compile(r'^[\w.\-:@]+$')
+
+
+class ConsoleError(Exception):
+    """Консоль узла не ответила или закрылась посреди обмена."""
 
 
 class PrepareError(Exception):
     """Шаг подготовки не выполнен. teacher=True — ошибка в файле лабы (нет
     узла, неподдерживаемый тип), повтор студентом не поможет."""
 
-    def __init__(self, node, step, detail, teacher=False):
+    def __init__(self, node, step, detail, teacher=False, hint=None):
         super().__init__(f'{node}: {step}: {detail}')
         self.node, self.step, self.detail, self.teacher = node, step, detail, teacher
+        self.hint = hint     # своя подсказка студенту вместо стандартной
 
 
 def _tail(text, lines=6, limit=600):
@@ -393,49 +400,119 @@ def linux_set_ip_script(iface, cidr, gw=None, dns=None):
     ])
 
 
+def cisco_config_lines(text):
+    """Строки конфига Cisco для отправки: без пустых, комментариев '!' и
+    входа/выхода из режима конфигурации (их добавляет консоль сама)."""
+    lines = []
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line or line.startswith('!'):
+            continue
+        if line.lower() in ('end', 'conf t', 'configure terminal'):
+            continue
+        lines.append(line)
+    return lines
+
+
+def cisco_verify_lines(lines):
+    """Строки, которые IOS хранит в running-config дословно и по которым после
+    отправки сверяется результат: hostname и ip address."""
+    return [l for l in lines if re.match(r'^(hostname \S+|ip address \d+\.\d+\.\d+\.\d+ \d+\.\d+\.\d+\.\d+)', l)]
+
+
+def _norm_ws(text):
+    return re.sub(r'[ \t]+', ' ', text)
+
+
+CISCO_MARKER_READ = 'show running-config | include ^alias exec prep-'
+
+
+def cisco_marker_line(token):
+    return f'alias exec prep-{token} show clock'
+
+
+def cisco_marker_tokens(output):
+    return re.findall(r'alias exec prep-([0-9a-f]+)', output or '')
+
+
 class PrepareContext:
     """То, что доступно функции prepare(ctx) в файле лабы.
 
     ctx.v                          — вариант студента (VARIANT/variant(v))
-    ctx.nodes, ctx.ostype          — узлы лабы и их тип ('linux', ...)
+    ctx.nodes, ctx.ostype          — узлы лабы и их тип ('linux', 'iol', ...)
+
+    Linux-узлы:
     await ctx.set_ip(узел, интерфейс, адрес, gw=None, dns=None)
                                      адрес — Addr из варианта или '10.1.1.10/24'
     await ctx.set_hostname(узел, имя)
     await ctx.mkdir(узел, путь)
     await ctx.write_file(узел, путь, текст, mode=None)   mode=0o755 и т. п.
     await ctx.shell(узел, 'команда')  — своя команда (sh -c), вывод строкой
+
+    Cisco (IOL, vIOS, vIOS-L2), через консоль:
+    await ctx.cisco_config(узел, 'текст конфига', reload=False, expect=())
+        строки уходят по одной в configure terminal; ответ IOS с «% ...»
+        (Invalid input, Incomplete и т. п.) останавливает подготовку. После
+        отправки hostname и ip address сверяются с running-config (плюс
+        строки из expect). В конце подготовки — write memory и очистка
+        истории консоли; reload=True — ещё и перезагрузка узла.
+        Интерактивные команды (с вопросами) не поддерживаются, banner — одной
+        строкой: banner motd #текст#.
+    await ctx.cisco_show(узел, 'show ...') — вывод команды
+
     ctx.username, ctx.lab_stem
 
-    Любая неудача (команда вернула не 0, узел не отвечает, тип узла пока не
+    Любая неудача (команда не прошла, узел не отвечает, тип узла пока не
     поддерживается) останавливает подготовку: студент видит узел, шаг и
     хвост вывода. Действия можно повторять: повторная подготовка безопасна.
-    Поддерживаются только Linux-узлы.
     """
 
-    def __init__(self, v, ostype, exec_fn, username='', lab_stem=''):
+    def __init__(self, v, ostype, exec_fn, username='', lab_stem='', console_fn=None):
         self.v = v
         self.ostype = dict(ostype)
         self.nodes = sorted(self.ostype)
         self.username, self.lab_stem = username, lab_stem
-        self._exec = exec_fn       # async (node, cmd) -> (rc, out, err)
-        self.touched = []          # узлы, на которых что-то настраивали
+        self._exec = exec_fn         # async (node, cmd) -> (rc, out, err)
+        self._console = console_fn   # async (node) -> сессия консоли | str-ошибка
+        self.touched = []            # узлы, на которых что-то настраивали
+        self.reload_nodes = set()    # Cisco-узлы, которые перезагрузить в конце
 
-    async def _run(self, node, step, cmd):
+    def _family(self, node, step, need):
         if node not in self.ostype:
             raise PrepareError(node, step, 'такого узла нет в лабе', teacher=True)
         fam = OS_FAMILY.get(self.ostype[node])
-        if fam != 'linux':
-            raise PrepareError(node, step, f'подготовка узлов типа «{self.ostype[node]}» пока не поддерживается',
-                               teacher=True)
+        if fam != need:
+            if fam is None:
+                detail = f'подготовка узлов типа «{self.ostype[node]}» пока не поддерживается'
+            else:
+                detail = f'это действие не для узлов типа «{self.ostype[node]}»'
+            raise PrepareError(node, step, detail, teacher=True)
+        return fam
+
+    def _touch(self, node):
+        if node not in self.touched:
+            self.touched.append(node)
+
+    async def _run(self, node, step, cmd):
+        self._family(node, step, 'linux')
         rc, out, err = await self._exec(node, cmd)
         if rc is None:
             raise PrepareError(node, step, err or 'узел не отвечает (возможно, ещё загружается)')
         if rc != 0:
             raise PrepareError(node, step, f'код {rc}: ' + (_tail(err) or _tail(out) or 'без вывода'))
-        if node not in self.touched:
-            self.touched.append(node)
+        self._touch(node)
         return out
 
+    async def _open_console(self, node, step):
+        self._family(node, step, 'cisco')
+        if self._console is None:
+            raise PrepareError(node, step, 'консоль недоступна')
+        sess = await self._console(node)
+        if isinstance(sess, str):
+            raise PrepareError(node, step, sess)
+        return sess
+
+    # ------------------------------------------------------------ Linux
     async def shell(self, node, cmd, step=None):
         return await self._run(node, step or f'команда «{cmd[:60]}»', cmd)
 
@@ -468,8 +545,88 @@ class PrepareContext:
     async def write_file(self, node, path, content, mode=None):
         await self._run(node, f'файл {path}', _write_cmd(str(path), content, mode))
 
+    # ------------------------------------------------------------ Cisco
+    async def cisco_config(self, node, text, reload=False, expect=()):
+        lines = cisco_config_lines(text)
+        step = 'конфигурация'
+        sess = await self._open_console(node, step)
+        try:
+            bad = await sess.configure(lines)
+            if bad:
+                line, detail = bad
+                # Строку не принял IOS (опечатка, интерактивная команда) —
+                # это файл лабы, повтор студентом не поможет
+                raise PrepareError(node, f'конфиг, строка: {line}', detail, teacher=True)
+            running = _norm_ws(await sess.exec('show running-config'))
+            need = cisco_verify_lines(lines) + [str(e) for e in expect]
+            missing = [l for l in need if _norm_ws(l) not in running]
+            if missing:
+                raise PrepareError(node, 'сверка конфигурации',
+                                   'в running-config нет строк: ' + '; '.join(missing[:5]),
+                                   hint='Похоже, во время подготовки кто-то работал в консоли узла. '
+                                        'Закройте консоли узлов и нажмите «Подготовить лабу» снова.')
+        except ConsoleError as e:
+            raise PrepareError(node, step, str(e))
+        finally:
+            await sess.close()
+        self._touch(node)
+        if reload:
+            self.reload_nodes.add(node)
+
+    async def cisco_show(self, node, cmd):
+        step = f'команда «{cmd[:60]}»'
+        sess = await self._open_console(node, step)
+        try:
+            return await sess.exec(cmd)
+        except ConsoleError as e:
+            raise PrepareError(node, step, str(e))
+        finally:
+            await sess.close()
+
+    # ------------------------------------------------------------ метка подготовки
     async def write_marker(self, node, token):
-        await self._run(node, 'метка подготовки', _write_cmd(MARKER_PATH, token + '\n', 0o644))
+        """Метка с отпечатком варианта. Для Cisco — alias exec в конфиге, после
+        неё write memory, очистка истории консоли и, если просили, reload."""
+        fam = OS_FAMILY.get(self.ostype.get(node))
+        if fam == 'linux':
+            await self._run(node, 'метка подготовки', _write_cmd(MARKER_PATH, token + '\n', 0o644))
+            return
+        step = 'сохранение конфигурации'
+        sess = await self._open_console(node, step)
+        try:
+            old = [t for t in cisco_marker_tokens(await sess.exec(CISCO_MARKER_READ)) if t != token]
+            bad = await sess.configure([f'no alias exec prep-{t}' for t in old] + [cisco_marker_line(token)])
+            if bad:
+                raise PrepareError(node, step, f'{bad[0]}: {bad[1]}')
+            err = await sess.save()
+            if err:
+                raise PrepareError(node, step, err)
+            await sess.clear_history()
+            if node in self.reload_nodes:
+                await sess.reload()
+        except ConsoleError as e:
+            raise PrepareError(node, step, str(e))
+        finally:
+            await sess.close()
+
+    async def read_marker(self, node):
+        """Отпечатки подготовки на узле: список (пустой — метки нет) или None,
+        если узел не ответил."""
+        fam = OS_FAMILY.get(self.ostype.get(node))
+        if fam == 'linux':
+            rc, out, _err = await self._exec(node, MARKER_READ_CMD)
+            return None if rc is None else [out.strip()] if out.strip() else []
+        if fam == 'cisco' and self._console is not None:
+            sess = await self._console(node)
+            if isinstance(sess, str):
+                return None
+            try:
+                return cisco_marker_tokens(await sess.exec(CISCO_MARKER_READ))
+            except ConsoleError:
+                return None
+            finally:
+                await sess.close()
+        return []
 
 
 MARKER_READ_CMD = f'cat {MARKER_PATH} 2>/dev/null || true'

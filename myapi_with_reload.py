@@ -1335,7 +1335,9 @@ class LabCheckContext:
     def __init__(self, lab_path, dict_of_name_and_ostype, dict_of_name_and_path,
                  add_check, errors_list, answer, add_penalty=None):
         self.lab_path = lab_path
-        self.ostype = dict(dict_of_name_and_ostype)
+        # Только узлы: основная проверка кладёт в этот же словарь отладочные
+        # данные (dict_of_name_and_ostype['debug'] = {...})
+        self.ostype = {n: t for n, t in dict(dict_of_name_and_ostype).items() if isinstance(t, str)}
         self.nodes = sorted(self.ostype)
         self.answer = answer
         self._paths = dict_of_name_and_path
@@ -1724,7 +1726,7 @@ def node_console_ports(ostype, paths):
     """{узел: порт консоли} Cisco-узлов лабы: IOL — по процессу iol_wrapper,
     qemu (vIOS) — по каталогу узла + 30000, как в проверке L2."""
     ports = {}
-    cisco = {n: t for n, t in ostype.items() if labprep.OS_FAMILY.get(t) == 'cisco'}
+    cisco = {n: t for n, t in ostype.items() if isinstance(t, str) and labprep.OS_FAMILY.get(t) == 'cisco'}
     iol = get_iol_console_ports() if 'iol' in cisco.values() else {}
     for node, t in cisco.items():
         if t == 'iol':

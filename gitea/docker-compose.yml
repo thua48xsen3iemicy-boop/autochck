@@ -1,0 +1,18 @@
+services:
+  gitea:
+    build: .
+    image: gitea-lab:1.24.6
+    container_name: gitea-lab
+    restart: unless-stopped
+    environment:
+      # Адрес, по которому Gitea видна с узлов лабы (как pip-зеркало)
+      - GITEA__server__ROOT_URL=http://10.19.36.2:3000/
+      - GITEA__server__DOMAIN=10.19.36.2
+      # Учётки студентов: число и префикс (student01..student30).
+      # Свой список логинов — файл data/lab/students.list, по логину в строке.
+      - LAB_STUDENTS=30
+      - LAB_PREFIX=student
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/data

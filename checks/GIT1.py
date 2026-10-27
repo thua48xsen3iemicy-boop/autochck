@@ -25,6 +25,9 @@ DNS не настраивается. Hostname, Git и SSH студент нас�
 пароля; его публичная часть извлекается ssh-keygen -y, приватная не выводится.
 На каждом Git-узле этот ключ должен быть в /root/.ssh/authorized_keys.
 SSH-конфигурацию и ключи создаёт студент, prepare их не меняет.
+На Git1–Git3 также проверяется /root/task-01: рабочий Git-репозиторий
+с тремя исходными коммитами из bundle в истории. Новые коммиты допускаются;
+для проверки достаточно хешей, сам bundle не требуется.
 Не ответивший или отсутствующий узел не получает баллы за свои проверки.
 """
 
@@ -224,6 +227,7 @@ async def check(ctx):
             ctx.error(f'{node}: пакет git не установлен или команда git --version не работает')
     ctx.add_check('Git установлен', good, len(GIT_NODES))
     await check_ssh(ctx)
+    await check_repository(ctx)
 
 
 # ssh -G читает ~/.ssh/config, системный ssh_config и рекурсивные Include,
@@ -310,3 +314,59 @@ async def check_ssh(ctx):
             ctx.error(f'{node}: общий ключ ROUTER не подтверждён в /root/.ssh/authorized_keys '
                       '(нет ключа, узел не ответил или ключ ROUTER не найден)')
     ctx.add_check('Ключ ROUTER в authorized_keys root', good, len(GIT_NODES))
+
+
+REPO_PATH = '/root/task-01'
+# Исходные коммиты git-lab-source.bundle; сам bundle для проверки не нужен.
+REPO_COMMITS = (
+    '55cf9bdd2fe5d47038e292562bbd5253508c14d7',
+    'c0f0169009e0c413ea9d4906af993baca1dac3e5',
+    'cb80c4930676a85df1e2591e6bc70c44cec7028f',
+)
+
+
+def repository_probe(path=REPO_PATH):
+    return r'''
+cd @PATH@ 2>/dev/null || { echo REPO_MISSING; exit 0; }
+# Не засчитывать обычную папку внутри чужого родительского репозитория.
+top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo NOT_REPO; exit 0; }
+[ "$top" = "$(pwd -P)" ] || { echo NOT_REPO; exit 0; }
+# Объектов, просто лежащих в .git/objects, недостаточно: нужна история.
+# --all учитывает также remote-tracking ветки обычного clone.
+history=$(git --no-replace-objects rev-list --all HEAD 2>/dev/null) || { echo HISTORY_ERROR; exit 0; }
+bad=0
+for commit in @COMMITS@; do
+    if ! printf '%s\n' "$history" | grep -Fxq "$commit"; then
+        echo "MISSING $commit"
+        bad=1
+    fi
+done
+[ "$bad" = 0 ] && echo REPO_OK
+exit 0
+'''.replace('@PATH@', shlex.quote(path)).replace('@COMMITS@', ' '.join(REPO_COMMITS))
+
+
+async def check_repository(ctx):
+    async def probe(node):
+        return await ctx.run(node, repository_probe()) if node in ctx.ostype else 'NONE'
+
+    outputs = await asyncio.gather(*(probe(n) for n in GIT_NODES))
+    good = 0
+    for node, out in zip(GIT_NODES, outputs):
+        if out.strip() == 'REPO_OK':
+            good += 1
+            continue
+        if out == 'NONE':
+            reason = 'узел не ответил'
+        elif out.strip() == 'REPO_MISSING':
+            reason = 'каталог отсутствует или недоступен'
+        elif out.strip() == 'NOT_REPO':
+            reason = 'каталог не является корнем рабочего Git-репозитория'
+        elif out.strip() == 'HISTORY_ERROR':
+            reason = 'не удалось прочитать историю Git'
+        else:
+            missing = [h for h in REPO_COMMITS if f'MISSING {h}' in out.splitlines()]
+            reason = ('в истории нет исходных коммитов: ' + ', '.join(h[:12] for h in missing)
+                      if missing else 'не удалось подтвердить исходный репозиторий')
+        ctx.error(f'{node}: репозиторий {REPO_PATH} — {reason}')
+    ctx.add_check('Исходный репозиторий в /root/task-01', good, len(GIT_NODES))

@@ -5,13 +5,14 @@ autocheck:on prepare:on. Все узлы запускаются перед по�
 
 ROUTER: ens3 — DHCP, ens4 — 10.10.1.254/24; IPv4 forwarding и nftables
 masquerade через ens3. Git1/Git2/Git3: ens3 — 10.10.1.1/2/3 с префиксом /24,
-шлюз 10.10.1.254, DNS 1.1.1.1 и 8.8.8.8. Коммутатор не настраивается.
+шлюз 10.10.1.254. Коммутатор не настраивается.
 Имена узлов в топологии должны совпадать с NODES; имя роутера задаёт ROUTER.
 
 Подготовка заменяет interfaces и nftables.conf (на роутере), сохраняет
 резервные копии, применяет настройки и сверяет адреса/шлюзы. Сетевой лог:
 /var/log/git1-prep.log. Повторная подготовка пропускает узлы с меткой.
-Hostname и Git студент настраивает сам: prepare их не меняет.
+Подготовка задаёт только адреса и шлюзы, форвардинг и NAT на ROUTER.
+DNS не настраивается. Hostname, Git и SSH студент настраивает сам.
 
 Оценка по отдельным пунктам, без дополнительных штрафов:
 - hostname на всех четырёх узлах: текущее и /etc/hostname; регистр не важен,
@@ -46,7 +47,6 @@ NODES = {
 IFACES_FILE = '/etc/network/interfaces'
 IFACES_OLD = '/etc/network/interfaces.git1-old'
 PREP_LOG = '/var/log/git1-prep.log'
-DNS = 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n'
 
 
 def interfaces_text(node):
@@ -165,8 +165,6 @@ async def prepare(ctx):
             await ctx.shell(node, NFT_BACKUP, step='резервная копия nftables')
             await ctx.write_file(node, '/etc/nftables.conf', NFT_CONFIG, mode=0o644)
             await ctx.shell(node, NFT_APPLY, step=f'NAT через {WAN} (nftables)')
-        else:
-            await ctx.write_file(node, '/etc/resolv.conf', DNS, mode=0o644)
 
 
 HOSTNAME_CMD = 'hostname; echo ===; head -n 1 /etc/hostname 2>/dev/null'

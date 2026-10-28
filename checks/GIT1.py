@@ -25,9 +25,10 @@ DNS не настраивается. Hostname, Git и SSH студент нас�
 пароля; его публичная часть извлекается ssh-keygen -y, приватная не выводится.
 На каждом Git-узле этот ключ должен быть в /root/.ssh/authorized_keys.
 SSH-конфигурацию и ключи создаёт студент, prepare их не меняет.
-На Git1–Git3 также проверяется /root/task-01: рабочий Git-репозиторий
-с тремя исходными коммитами из bundle в истории. Новые коммиты допускаются;
-для проверки достаточно хешей, сам bundle не требуется.
+На Git1–Git3 проверяются задания 1–5 в /root/task-01 … /root/task-05:
+ветки, исходные версии, изменение MAINTAINER, перенос коммита task-03
+в task-04, чистота файлов и индекса, updateInstead. См. docs/git1-student.md.
+Сам bundle для проверки не требуется; преднастрой не меняется.
 Не ответивший или отсутствующий узел не получает баллы за свои проверки.
 """
 
@@ -316,57 +317,126 @@ async def check_ssh(ctx):
     ctx.add_check('Ключ ROUTER в authorized_keys root', good, len(GIT_NODES))
 
 
-REPO_PATH = '/root/task-01'
-# Исходные коммиты git-lab-source.bundle; сам bundle для проверки не нужен.
-REPO_COMMITS = (
-    '55cf9bdd2fe5d47038e292562bbd5253508c14d7',
-    'c0f0169009e0c413ea9d4906af993baca1dac3e5',
-    'cb80c4930676a85df1e2591e6bc70c44cec7028f',
-)
+SOURCE_ROOT = '55cf9bdd2fe5d47038e292562bbd5253508c14d7'
+SOURCE_MAIN = 'c0f0169009e0c413ea9d4906af993baca1dac3e5'
+SOURCE_TRAINING = 'cb80c4930676a85df1e2591e6bc70c44cec7028f'
+# Tree = имена, режимы и содержимое всех файлов после единственной замены
+# MAINTAINER="Не назначен" -> MAINTAINER="Учебная группа" в исходной main.
+TASK3_TREE = '796f8df8a5d529ed1f79726eca77b345da468943'
+TASKS = range(1, 6)
 
 
-def repository_probe(path=REPO_PATH):
+def exercise_probe(task, path=None):
+    """Только чтение: один рабочий репозиторий, без bundle и сетевых запросов."""
+    if task not in TASKS:
+        raise ValueError('неизвестное задание')
+    path = path or f'/root/task-{task:02}'
+    expected_branch = 'training' if task == 5 else 'main'
+    expected_branches = 'main\ntraining' if task == 5 else 'main'
+    if task in (1, 2):
+        version = f'[ "$main" = {SOURCE_MAIN} ]'
+    elif task == 3:
+        version = (f'[ "$(git rev-list --parents --max-count=1 main 2>/dev/null)" = "$main {SOURCE_MAIN}" ]'
+                   f' && [ "$(git rev-parse "main^{{tree}}" 2>/dev/null)" = {TASK3_TREE} ]')
+    elif task == 5:
+        version = (f'[ "$main" = {SOURCE_MAIN} ]'
+                   f' && [ "$(git rev-parse --verify "refs/heads/training^{{commit}}" 2>/dev/null)" = {SOURCE_TRAINING} ]')
+    else:
+        # Версия task-04 сравнивается с проверенной task-03 в check_repository.
+        version = 'false'
     return r'''
+export GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0
 cd @PATH@ 2>/dev/null || { echo REPO_MISSING; exit 0; }
-# Не засчитывать обычную папку внутри чужого родительского репозитория.
 top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo NOT_REPO; exit 0; }
 [ "$top" = "$(pwd -P)" ] || { echo NOT_REPO; exit 0; }
-# Объектов, просто лежащих в .git/objects, недостаточно: нужна история.
-# --all учитывает также remote-tracking ветки обычного clone.
-history=$(git --no-replace-objects rev-list --all HEAD 2>/dev/null) || { echo HISTORY_ERROR; exit 0; }
-bad=0
-for commit in @COMMITS@; do
-    if ! printf '%s\n' "$history" | grep -Fxq "$commit"; then
-        echo "MISSING $commit"
-        bad=1
-    fi
-done
-[ "$bad" = 0 ] && echo REPO_OK
-exit 0
-'''.replace('@PATH@', shlex.quote(path)).replace('@COMMITS@', ' '.join(REPO_COMMITS))
+echo REPO_OK
+main=$(git rev-parse --verify 'refs/heads/main^{commit}' 2>/dev/null) || main=''
+[ -z "$main" ] || printf 'MAIN %s\n' "$main"
+branches=$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)
+current=$(git symbolic-ref --short -q HEAD 2>/dev/null)
+tags=$(git for-each-ref --format='%(refname)' refs/tags 2>/dev/null)
+if [ "$branches" = @BRANCHES@ ] && [ "$current" = @CURRENT@ ] && [ -z "$tags" ]; then
+    echo BRANCHES_OK
+fi
+if status=$(git -c core.fsmonitor=false status --porcelain --untracked-files=all 2>/dev/null) && [ -z "$status" ]; then
+    echo CLEAN_OK
+fi
+if [ "$(git config --local --get receive.denyCurrentBranch 2>/dev/null)" = updateInstead ]; then
+    echo RECEIVE_OK
+fi
+if @VERSION@ && git merge-base --is-ancestor @ROOT@ main 2>/dev/null; then
+    echo VERSION_OK
+fi
+'''.replace('@PATH@', shlex.quote(path)).replace('@BRANCHES@', shlex.quote(expected_branches)).replace(
+        '@CURRENT@', shlex.quote(expected_branch)).replace('@VERSION@', version).replace('@ROOT@', SOURCE_ROOT)
+
+
+def exercises_probe():
+    # Одна guest-agent команда на узел, задания выполняются последовательно.
+    return '\n'.join(f"printf '===TASK{task:02}===\\n'\n(\n{exercise_probe(task)}\n)" for task in TASKS)
+
+
+def parse_exercises(out):
+    result, task = {}, None
+    for line in (out or '').splitlines():
+        match = re.fullmatch(r'===TASK(0[1-5])===', line)
+        if match:
+            task = int(match[1])
+            result[task] = set()
+        elif task is not None:
+            result[task].add(line)
+    return result
+
+
+def exercise_main(lines):
+    values = [line[5:] for line in lines if re.fullmatch(r'MAIN [0-9a-f]{40}', line)]
+    return values[0] if len(values) == 1 else None
 
 
 async def check_repository(ctx):
     async def probe(node):
-        return await ctx.run(node, repository_probe()) if node in ctx.ostype else 'NONE'
+        return await ctx.run(node, exercises_probe()) if node in ctx.ostype else 'NONE'
 
     outputs = await asyncio.gather(*(probe(n) for n in GIT_NODES))
-    good = 0
-    for node, out in zip(GIT_NODES, outputs):
-        if out.strip() == 'REPO_OK':
-            good += 1
-            continue
-        if out == 'NONE':
-            reason = 'узел не ответил'
-        elif out.strip() == 'REPO_MISSING':
-            reason = 'каталог отсутствует или недоступен'
-        elif out.strip() == 'NOT_REPO':
-            reason = 'каталог не является корнем рабочего Git-репозитория'
-        elif out.strip() == 'HISTORY_ERROR':
-            reason = 'не удалось прочитать историю Git'
-        else:
-            missing = [h for h in REPO_COMMITS if f'MISSING {h}' in out.splitlines()]
-            reason = ('в истории нет исходных коммитов: ' + ', '.join(h[:12] for h in missing)
-                      if missing else 'не удалось подтвердить исходный репозиторий')
-        ctx.error(f'{node}: репозиторий {REPO_PATH} — {reason}')
-    ctx.add_check('Исходный репозиторий в /root/task-01', good, len(GIT_NODES))
+    states = {node: parse_exercises(out) for node, out in zip(GIT_NODES, outputs)}
+    criteria = (
+        ('REPO_OK', 'каталог отсутствует, недоступен или не является корнем рабочего Git-репозитория'),
+        ('BRANCHES_OK', 'неверные локальные ветки, выбранная ветка или присутствуют теги'),
+        ('VERSION_OK', 'версия/история не соответствует заданию'),
+        ('CLEAN_OK', 'рабочий каталог или индекс не чистый либо состояние Git не удалось прочитать'),
+        ('RECEIVE_OK', 'в настройках репозитория нет receive.denyCurrentBranch=updateInstead'),
+    )
+    for task in TASKS:
+        score = 0
+        for node, raw in zip(GIT_NODES, outputs):
+            lines = set(states[node].get(task, ()))
+            if task == 4:
+                source = states[node].get(3, set())
+                source_main = exercise_main(source)
+                if ('VERSION_OK' in source and source_main
+                        and exercise_main(lines) == source_main):
+                    lines.add('VERSION_OK')
+            for flag, reason in criteria:
+                if flag in lines:
+                    score += 1
+                elif raw != 'NONE' and 'REPO_OK' in lines:
+                    if task == 4 and flag == 'VERSION_OK':
+                        reason = 'main не совпадает с корректной main задания 3 на этом узле'
+                    ctx.error(f'{node}, task-{task:02}: {reason}')
+            if raw == 'NONE':
+                ctx.error(f'{node}, task-{task:02}: узел не ответил, задание не проверено')
+            elif 'REPO_OK' not in lines:
+                ctx.error(f'{node}, task-{task:02}: {criteria[0][1]}')
+        ctx.add_check(f'Задание {task}: репозиторий /root/task-{task:02}', score, 5 * len(GIT_NODES))
+
+    task3 = [states[n].get(3, set()) for n in GIT_NODES]
+    main3 = [exercise_main(s) for s in task3]
+    same3 = all('VERSION_OK' in s for s in task3) and bool(main3[0]) and len(set(main3)) == 1
+    ctx.add_check('Задание 3: один коммит на всех узлах', int(same3), 1)
+    if not same3:
+        ctx.error('Задание 3: на Git1–Git3 должна быть одна и та же корректная main в task-03')
+    main4 = [exercise_main(states[n].get(4, set())) for n in GIT_NODES]
+    same4 = same3 and all(h == main3[0] for h in main4)
+    ctx.add_check('Задание 4: история совпадает во всех шести репозиториях', int(same4), 1)
+    if not same4:
+        ctx.error('Задание 4: main должна совпадать во всех task-03 и task-04 на Git1–Git3')
